@@ -211,7 +211,7 @@ pub struct Dns {
 /// ★ 这里的每一条都是真机实测逼出来的，不是随手填的：
 ///
 /// - `nameserver` **默认用明文 IP DNS，不用 DoH**。
-///   真机（172.20.0.101）实测 `doh.pub` 连 443 超时 8 秒，
+///   真机（192.168.10.1）实测 `doh.pub` 连 443 超时 8 秒，
 ///   内核表现为：
 ///       [DNS] resolve www.baidu.com A from https://doh.pub/dns-query
 ///       [TCP] dial PROXY ... error: dns resolve failed: context deadline exceeded

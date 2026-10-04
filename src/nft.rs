@@ -53,7 +53,7 @@ pub struct Gateway {
     /// 直连网段（这些网段的流量不代理，只转发）。
     ///
     /// ★ 默认值刻意**只有组播与保留段**，不含任何私网段。
-    /// 这不是偷懒，是实测逼出来的：本机所在网段是 172.20.0.0/24，
+    /// 这不是偷懒，是实测逼出来的：本机所在网段是 192.168.10.0/24，
     /// 而 `172.16.0.0/12` 恰好包含 172.20 —— 把 RFC1918 全段写成
     /// 默认直连规则，会让「内网直连」匹配上所有 172.20.x.x 目标，
     /// 代理彻底失效，表现为「网关配对了但流量不走代理」。
@@ -106,7 +106,7 @@ impl Gateway {
         if self.lan_clients.is_empty() {
             bail!(
                 "lan_clients 为空：这意味着任何能路由到本机的设备流量都会被劫持。\n\
-                 请显式列出客户端网段（如 172.20.0.0/24），这是安全下限。"
+                 请显式列出客户端网段（如 192.168.10.0/24），这是安全下限。"
             );
         }
         Ok(())
@@ -442,11 +442,11 @@ mod tests {
 
     fn gw() -> Gateway {
         Gateway {
-            lan_addr: "172.20.0.101".into(),
+            lan_addr: "192.168.10.1".into(),
             iface: "eth0".into(),
             tproxy_port: 7894,
             dns_port: 7874,
-            lan_clients: vec!["172.20.0.0/24".into()],
+            lan_clients: vec!["192.168.10.0/24".into()],
             ..Default::default()
         }
     }
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn 规则集含关键防环线条目() {
         let r = render_ruleset(&gw());
-        assert!(r.contains("ip daddr 172.20.0.101 return"));
+        assert!(r.contains("ip daddr 192.168.10.1 return"));
         assert!(r.contains("tproxy to :7894"));
         assert!(r.contains("dnat to :7874"));
         assert!(r.contains("table inet clashx"));

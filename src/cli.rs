@@ -358,7 +358,7 @@ impl Cli {
             .or_else(default_route_iface);
 
         // ★ IPv6：实测有些环境 IPv4 出站不通、只有 IPv6 能出网
-        // （本机172.20.0.101 就是：curl -4 超时、curl -6 正常）。
+        // （本机192.168.10.1 就是：curl -4 超时、curl -6 正常）。
         // 而 mihomo 的 `ipv6: false` 会**拒答AAAA 记录**，
         // 于是内核只拿到 A 记录 -> 连不通 -> 表现是
         //     [TCP] dial PROXY ... dns resolve failed: context deadline exceeded
@@ -1173,7 +1173,7 @@ impl Cli {
 
 /// 探测「只有 IPv6 能出网」的环境。
 ///
-/// 真机 172.20.0.101实测：`curl -4 http://www.baidu.com` 8 秒超时，
+/// 真机 192.168.10.1实测：`curl -4 http://www.baidu.com` 8 秒超时，
 /// 而 `curl -6` 0.08 秒返回 200。这种环境里 mihomo 的 `ipv6: false`
 /// 会拒答 AAAA 记录，内核只拿到 A 记录然后连不通，
 /// 表现为「DNS 解析超时 / 连接超时」，很容易被误判成配置错误。
@@ -1234,7 +1234,7 @@ fn read_gen_str(paths: &Paths, key: &str) -> Option<String> {
 /// （真机实测：本机IPv4 默认路由不明确，`curl -4` 直连超时、`curl -6` 正常）。
 ///
 /// 解析要小心：`ip route` 输出是
-///     default via 172.20.0.2 dev eth0 proto static
+///     default via 192.168.10.254 dev eth0 proto static
 /// `dev` 后面**才是**网卡名 —— 用 `find(|t| *t == "dev")` 会拿到
 /// "dev" 这个单词本身（第一版就踩了这个坑，见docs/10）。
 fn default_route_iface() -> Option<String> {
@@ -1513,7 +1513,7 @@ impl Cli {
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
-            // 输出形如：eth0  UP  172.20.0.101/24
+            // 输出形如：eth0  UP  192.168.10.1/24
             let mut parts = line.split_whitespace();
             let _name = parts.next()?;
             let _state = parts.next()?;
