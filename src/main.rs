@@ -9,6 +9,7 @@
 mod cli;
 mod config;
 mod core;
+mod nft;
 mod render;
 mod rule;
 mod sub;

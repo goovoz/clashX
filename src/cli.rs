@@ -111,6 +111,50 @@ pub enum Cmd {
 
     /// 列出本机所有网络接口（配 bypass-router 时用）
     Ifaces,
+
+    /// 旁路由（网关模式）：管理 nftables 转发规则
+    #[command(subcommand)]
+    Gateway(GwsCmd),
+}
+
+/// 旁路由子命令。
+#[derive(Subcommand)]
+pub enum GwsCmd {
+    /// 启用旁路由：nftables + policy routing
+    Enable {
+        /// 本机局域网地址（旁路由的网关地址）
+        #[arg(long)]
+        lan_addr: String,
+        /// 出口网卡
+        #[arg(long)]
+        iface: String,
+        /// 客户端网段，逗号分隔（只这些网段的流量会被代理）
+        #[arg(long, default_value = "")]
+        clients: String,
+        /// tproxy 端口（要与配置里的 tproxy-port 一致）
+        #[arg(long, default_value_t = 7894)]
+        tproxy_port: u16,
+        /// DNS 劫持端口（0 = 不劫持）
+        #[arg(long, default_value_t = 7874)]
+        dns_port: u16,
+    },
+    /// 停用旁路由（删规则与 policy route，保留配置）
+    Disable,
+    /// 查看旁路由状态
+    Status,
+    /// 打印将要应用的 nft 规则（调试用，不实际应用）
+    DryRun {
+        #[arg(long)]
+        lan_addr: String,
+        #[arg(long)]
+        iface: String,
+        #[arg(long, default_value = "")]
+        clients: String,
+        #[arg(long, default_value_t = 7894)]
+        tproxy_port: u16,
+        #[arg(long, default_value_t = 7874)]
+        dns_port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -253,6 +297,7 @@ impl Cli {
             Cmd::Mode { value } => self.set_mode(paths, value),
             Cmd::Show => self.show(paths),
             Cmd::Ifaces => self.ifaces(),
+            Cmd::Gateway(c) => self.gateway(c),
         }
     }
 
@@ -1182,4 +1227,87 @@ fn default_route_iface() -> Option<String> {
         }
     }
     None
+}
+// ---- 旁路由实现 ---------------------------------------------------
+// 单独一个 impl 块：逻辑上跟其它子命令无关，且后面若要加 Web UI
+// 的 API handler，代码位置是现成的。
+impl Cli {
+    fn parse_clients(s: &str) -> Vec<String> {
+        s.split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .map(|x| x.to_string())
+            .collect()
+    }
+
+    fn build_gw(
+        lan_addr: &str,
+        iface: &str,
+        clients: &str,
+        tproxy_port: u16,
+        dns_port: u16,
+    ) -> crate::nft::Gateway {
+        let mut g = crate::nft::Gateway {
+            lan_addr: lan_addr.to_string(),
+            iface: iface.to_string(),
+            tproxy_port,
+            dns_port,
+            lan_clients: Self::parse_clients(clients),
+            ..Default::default()
+        };
+        // tproxy 端口若为 0，尝试从用户配置里读，避免两边不一致
+        if g.tproxy_port == 0 {
+            g.tproxy_port = 7894;
+        }
+        g
+    }
+
+    fn gateway(&self, c: &GwsCmd) -> Result<()> {
+        use crate::nft;
+        match c {
+            GwsCmd::Enable {
+                lan_addr,
+                iface,
+                clients,
+                tproxy_port,
+                dns_port,
+            } => {
+                let g = Self::build_gw(lan_addr, iface, clients, *tproxy_port, *dns_port);
+                g.precheck()?;
+                nft::enable(&g)?;
+                println!("旁路由已启用");
+                println!("  nft 表: inet clashx");
+                println!("  出口网卡: {}", g.iface);
+                println!("  客户端网段: {}", g.lan_clients.join(", "));
+                println!("  tproxy 端口: {}", g.tproxy_port);
+                if g.dns_port > 0 {
+                    println!("  DNS 劫持: 53 -> {}", g.dns_port);
+                }
+                println!();
+                println!("客户端设置网关为 {} 后，其流量会经本机代理。", g.lan_addr);
+            }
+            GwsCmd::Disable => {
+                nft::disable()?;
+                println!("旁路由已停用（配置与内核服务保持运行）");
+            }
+            GwsCmd::Status => {
+                print!("{}", nft::status());
+            }
+            GwsCmd::DryRun {
+                lan_addr,
+                iface,
+                clients,
+                tproxy_port,
+                dns_port,
+            } => {
+                let g = Self::build_gw(lan_addr, iface, clients, *tproxy_port, *dns_port);
+                print!("{}", nft::render_ruleset(&g));
+                eprintln!("--- policy routing ---");
+                eprint!("{}", nft::render_policy_route());
+                eprintln!("--- sysctl ---");
+                eprint!("{}", nft::render_sysctl());
+            }
+        }
+        Ok(())
+    }
 }
