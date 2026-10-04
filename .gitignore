@@ -1,2 +1,5 @@
 target/
 *.tar.gz
+
+# 工作记忆与本地工具，不进仓库
+.workbuddy/
