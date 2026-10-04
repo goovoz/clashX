@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
+    /// 运行模式（对齐 OpenClash 的 6 值枚举）。
+    /// 内部会拆成 dns_mode × firewall_owner 两个维度，
+    /// 见 `runmode::RunMode::resolve()`。
+    #[serde(default)]
+    pub run_mode: crate::runmode::RunMode,
+
     /// 显式代理入站（本机代理模式的核心）。
     pub inbound: Inbound,
     /// 透明代理入站（旁路由模式的核心）。
@@ -111,7 +117,14 @@ pub struct Transparent {
     /// 启用 strict-route（Linux 上防地址泄漏）。
     pub strict_route: bool,
     /// 由 mihomo 自动配置 iptables/nftables 转发（Linux 专有）。
+    ///
+    /// ★ TUN 模式下必须为 false（OpenClash `yml_change.sh:526-528`）：
+    /// 让 clashx 自己管路由，mihomo 只负责接管。两边都写会抢chain，
+    /// 内核启动直接失败（openclash-rt 那轮踩过 `inet fw4` 的 nat_output 冲突）。
     pub auto_redirect: bool,
+    /// 端点无关 NAT。改善 UDP / 双向连接的兼容性，
+    /// OpenClash 在 TUN 模式固定开启（`yml_change.sh:524`）。
+    pub endpoint_independent_nat: bool,
     /// DNS 劫持列表。
     pub dns_hijack: Vec<String>,
     /// 排除的网卡（这些网卡的流量不进 TUN）。
@@ -142,6 +155,7 @@ impl Default for Transparent {
             tun_mtu: 9000,
             strict_route: true,
             auto_redirect: true,
+            endpoint_independent_nat: true,
             dns_hijack: vec!["any:53".into()],
             // lo 必须排除；65534 = nobody，是mihomo 的默认运行用户
             exclude_interface: vec!["lo".into()],
@@ -423,6 +437,10 @@ pub struct Sniffer {
     pub enable: bool,
     /// 覆写目标地址（让规则能按域名匹配 HTTPS）。
     pub override_destination: bool,
+    /// ★ redir-host 模式**必须**为 true（OpenClash `yml_change.sh:509`）。
+    /// redir-host 没有 fake-ip 映射表，域名只能靠嗅探还原；
+    /// 不开这个，所有域名类型规则会全部失效。
+    pub force_dns_mapping: bool,
 }
 
 impl Default for Sniffer {
@@ -430,6 +448,7 @@ impl Default for Sniffer {
         Self {
             enable: true,
             override_destination: true,
+            force_dns_mapping: true,
         }
     }
 }

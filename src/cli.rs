@@ -115,9 +115,35 @@ pub enum Cmd {
     /// 旁路由（网关模式）：管理 nftables 转发规则
     #[command(subcommand)]
     Gateway(GwsCmd),
+
+    /// 查看 / 切换运行模式（fake-ip / redir-host × 防火墙接管方式）
+    #[command(subcommand)]
+    RunMode(RunModeCmd),
 }
 
 /// 旁路由子命令。
+/// 运行模式子命令。
+#[derive(Subcommand)]
+pub enum RunModeCmd {
+    /// 显示当前运行模式与全部可选值
+    Show,
+    /// 切换运行模式（会重启内核）
+    Set {
+        /// fake-ip / redir-host / fake-ip-tun / redir-host-tun / fake-ip-mix / redir-host-mix
+        value: String,
+    },
+}
+
+/// 全部运行模式（顺序即 UI 展示顺序：对齐 OpenClash 的排列）。
+pub const ALL_RUN_MODES: [crate::runmode::RunMode; 6] = [
+    crate::runmode::RunMode::FakeIp,
+    crate::runmode::RunMode::RedirHost,
+    crate::runmode::RunMode::FakeIpTun,
+    crate::runmode::RunMode::RedirHostTun,
+    crate::runmode::RunMode::FakeIpMix,
+    crate::runmode::RunMode::RedirHostMix,
+];
+
 #[derive(Subcommand)]
 pub enum GwsCmd {
     /// 启用旁路由：nftables + policy routing
@@ -298,6 +324,10 @@ impl Cli {
             Cmd::Show => self.show(paths),
             Cmd::Ifaces => self.ifaces(),
             Cmd::Gateway(c) => self.gateway(c),
+            Cmd::RunMode(c) => match c {
+                RunModeCmd::Show => self.run_mode_show(paths),
+                RunModeCmd::Set { value } => self.run_mode_set(paths, value),
+            },
         }
     }
 
@@ -1308,6 +1338,73 @@ impl Cli {
                 eprint!("{}", nft::render_sysctl());
             }
         }
+        Ok(())
+    }
+}
+
+// ---- 运行模式（OpenClash 式二维模型）--------------------------------
+//
+// 与 `mode` 命令的分工：
+// - `mode` 改的是 mihomo 的 rule/global/direct（流量走哪条路）
+// - `run-mode` 改的是 fake-ip/redir-host × 防火墙接管方式（流量怎么进来）
+//
+// 切换 run-mode 会重启内核 —— tun 开关是启动期参数，
+// 内核的 RESTful API 改不了（只有 dns 模式能热改），所以走
+// 「改配置 -> apply -> 重启」路径，与 OpenClash 的做法一致。
+impl Cli {
+    fn run_mode_show(&self, paths: &Paths) -> Result<()> {
+        let cfg = load_config(paths)?;
+        let rm = cfg.run_mode;
+        let r = rm.resolve();
+        println!("运行模式: {}", rm.as_str());
+        println!("  DNS 模式      : {}", rm.dns_mode_name());
+        println!("  TUN           : {}", if r.tun_enable { "启用" } else { "关闭" });
+        println!("  防火墙由谁写  : {:?}", r.firewall);
+        println!("  需要 mixed-port: {}", r.need_explicit_port);
+        println!();
+        println!("可选值:");
+        for m in ALL_RUN_MODES {
+            let tag = if m == rm { "  (当前)" } else { "" };
+            println!("  {}{}", m.as_str(), tag);
+        }
+        Ok(())
+    }
+
+    fn run_mode_set(&self, paths: &Paths, value: &str) -> Result<()> {
+        let target = crate::runmode::RunMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "无法识别的运行模式: {value}\n可选: {}",
+                ALL_RUN_MODES
+                    .iter()
+                    .map(|m| m.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            )
+        })?;
+
+        let mut cfg = load_config(paths)?;
+        if cfg.run_mode == target {
+            println!("运行模式已经是 {}，无需改动", target.as_str());
+            return Ok(());
+        }
+        let old = cfg.run_mode;
+        cfg.run_mode = target;
+
+        // 副作用：redir 系需要开 mixed-port，供不会用透明代理的客户端连接。
+        // 纯 fake-ip + tun 由内核全接管，不需要。
+        if target.resolve().need_explicit_port && cfg.inbound.mixed_port == 0 {
+            cfg.inbound.mixed_port = 7893;
+        }
+
+        save_config(paths, &cfg)?;
+        println!("运行模式: {} -> {}", old.as_str(), target.as_str());
+
+        // 落盘后立即 apply，让 mihomo -t 先校验一遍
+        self.apply(paths, false)?;
+
+        println!("配置已校验，重启内核使tun / dns 模式生效...");
+        crate::core::Systemd::new("mihomo-client").restart()?;
+        println!("完成。验证：clashx run-mode show");
         Ok(())
     }
 }

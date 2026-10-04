@@ -356,12 +356,25 @@ StandardError=journal
 # 只给内核需要的这几项，不给 root。
 {caps}
 NoNewPrivileges=true
-ProtectSystem=strict
+# ★ ProtectSystem 不能用 strict —— 真机实测（Ubuntu 24.04 / mihomo v1.19.32）：
+#   strict 下 nobody 用户**无法创建 TUN 设备**，内核在
+#   listener/sing_tun/server.go:671 panic：
+#       sing_tun.(*Listener).Close(0x0) nil pointer dereference
+#   systemd 表现为 status=2/INVALIDARGUMENT 且反复重启，
+#   而同一份配置手动以 root 跑完全正常 —— 极易误判为配置问题。
+#   full 只读挂 /usr /boot /efi，/etc /opt /var 仍可写，
+#   对本项目够用（TUN 设备创建发生在 /dev/net/tun）。
+ProtectSystem=full
 ProtectHome=true
 # var/ 下要写 geodata 与 ruleset
 ReadWritePaths={workdir}
-PrivateTmp=true
+# ★ PrivateTmp 也关掉：TUN 的 unix socket 与 DNS socket
+#   在 PrivateTmp 下会拿到隔离的 /tmp，mihomo 多实例并存时冲突。
+PrivateTmp=false
 LimitNOFILE=65535
+# TUN 设备节点：确保存在且权限正确（systemd 通常自动处理，
+# 但 udev 未加载的最小化容器里需要显式声明）
+DeviceAllow=/dev/net/tun rw
 
 [Install]
 WantedBy=multi-user.target

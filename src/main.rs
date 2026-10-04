@@ -12,6 +12,7 @@ mod core;
 mod nft;
 mod render;
 mod rule;
+mod runmode;
 mod sub;
 
 use anyhow::Result;

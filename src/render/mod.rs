@@ -23,6 +23,8 @@ pub struct Rendered {
 
 /// 把用户配置渲染为 mihomo 配置。
 pub fn render(cfg: &Config, proxies: &[Proxy]) -> Rendered {
+    // ★ 唯一入口：运行模式拆成两个正交维度（见 runmode 模块文档）
+    let rm = crate::runmode::RunMode::resolve(cfg.run_mode);
     let mut m = Mapping::new();
     let mut w = Vec::new();
 
@@ -65,44 +67,77 @@ pub fn render(cfg: &Config, proxies: &[Proxy]) -> Rendered {
     }
 
     // ---- 透明入站 ----
-    match cfg.transparent.mode {
-        TransparentMode::Off => {}
-        TransparentMode::Tun => {
-            let mut tun = Mapping::new();
-            tun.insert("enable".into(), true.into());
-            tun.insert("stack".into(), cfg.transparent.tun_stack.as_str().into());
-            tun.insert("device".into(), cfg.transparent.tun_device.as_str().into());
-            tun.insert("mtu".into(), cfg.transparent.tun_mtu.into());
-            tun.insert("strict-route".into(), cfg.transparent.strict_route.into());
-            tun.insert("auto-route".into(), true.into());
-            // auto-redirect 让 mihomo 自己写 nftables/iptables，
-            // 我们不碰防火墙 —— 这是选 tun 而非 redir/tproxy 的主因。
-            if cfg.transparent.auto_redirect {
-                tun.insert("auto-redirect".into(), true.into());
-            }
-            if !cfg.transparent.dns_hijack.is_empty() {
-                tun.insert("dns-hijack".into(), to_value(&cfg.transparent.dns_hijack));
-            }
-            if !cfg.transparent.exclude_interface.is_empty() {
-                tun.insert(
-                    "exclude-interface".into(),
-                    to_value(&cfg.transparent.exclude_interface),
-                );
-            }
-            if !cfg.transparent.exclude_uid.is_empty() {
-                tun.insert(
-                    "exclude-uid".into(),
-                    to_value(&cfg.transparent.exclude_uid),
-                );
-            }
-            // tun 必须挂到 exclude-uid 之后插入（漏了会让整个 tun 配置
-            // 不生效 —— 页面无报错但旁路由不工作，极难排查）
-            m.insert("tun".into(), tun.into());
+    // ★ 这里不再 match cfg.transparent.mode —— 那个字段降级为
+    //   「是否启用 TUN」的可读性入口，真正的开关是 run_mode。
+    //   这是 OpenClash 的核心做法（init.d/openclash:485-510）：
+    //   UI 上一个枚举，脚本里立刻拆成两个正交变量。
+    if rm.tun_enable {
+        let mut tun = Mapping::new();
+        tun.insert("enable".into(), true.into());
+        tun.insert("stack".into(), cfg.transparent.tun_stack.as_str().into());
+        tun.insert("device".into(), cfg.transparent.tun_device.as_str().into());
+        tun.insert("mtu".into(), cfg.transparent.tun_mtu.into());
+        tun.insert("strict-route".into(), cfg.transparent.strict_route.into());
+
+        // ★★ auto-route 与 auto-redirect 必须成对一致，否则内核 panic。
+        //
+        // 真机实测（Ubuntu 24.04/ kernel 6.8 / mihomo v1.19.32）
+        // 六组组合逐一验证：
+        //   auto-route=F auto-redirect=T -> panic ✗（nil pointer at
+        //       listener/sing_tun/server.go:671，systemd status=2）
+        //   auto-route=T auto-redirect=F -> OK
+        //   auto-route=T auto-redirect=T -> OK
+        //   auto-route=F auto-redirect=F -> OK
+        // 结论：**auto-redirect 依赖 auto-route 建好的路由集**，
+        // 单独开auto-redirect 会让它拿到空路由集然后崩。
+        //
+        // 两种合法的策略（对应 run_mode 的 firewall 维度）：
+        // - Mihomo 独占：auto-route=true + auto-redirect=true，
+        //   mihomo 自己管路由与防火墙，clashx 完全不碰 nftables。
+        //   这是最省心的旁路由方案，也天然满足「客户端零配置」。
+        // - Clashx / Both：auto-route=false + auto-redirect=false，
+        //   路由与防火墙都归 clashx。OpenClash 用的是这套
+        //   （yml_change.sh:526-528），但要求 clashx 必须自己写全
+        //   policy routing —— 本项目tproxy 那条路正是卡在这里。
+        let mihomo_owns_fw = rm.firewall == crate::runmode::FirewallOwner::Mihomo;
+        tun.insert("auto-route".into(), mihomo_owns_fw.into());
+        tun.insert(
+            "auto-redirect".into(),
+            (cfg.transparent.auto_redirect && mihomo_owns_fw).into(),
+        );
+
+        // 端点无关 NAT：改善 UDP / 双向连接兼容性
+        // （OpenClash TUN 模式固定开启，yml_change.sh:524）
+        tun.insert(
+            "endpoint-independent-nat".into(),
+            cfg.transparent.endpoint_independent_nat.into(),
+        );
+
+        if !cfg.transparent.dns_hijack.is_empty() {
+            tun.insert("dns-hijack".into(), to_value(&cfg.transparent.dns_hijack));
         }
-        TransparentMode::Redir => {
+        if !cfg.transparent.exclude_interface.is_empty() {
+            tun.insert(
+                "exclude-interface".into(),
+                to_value(&cfg.transparent.exclude_interface),
+            );
+        }
+        if !cfg.transparent.exclude_uid.is_empty() {
+            // exclude-uid 是防环路三手段之一。类型必须 uint32 ——
+            // 写成字符串内核报 cannot unmarshal !!str into uint32（真机踩过）。
+            tun.insert("exclude-uid".into(), to_value(&cfg.transparent.exclude_uid));
+        }
+
+        // ★ tun 段必须挂最后。顺序错了内核能起但旁路由不工作，
+        //   页面无任何报错 —— 排查代价极高。
+        m.insert("tun".into(), tun.into());
+    } else {
+        // 非 TUN 模式：透明入站靠 nftables 规则表达，
+        // mihomo 侧只需开对应端口。
+        if cfg.transparent.redir_port > 0 {
             m.insert("redir-port".into(), cfg.transparent.redir_port.into());
         }
-        TransparentMode::Tproxy => {
+        if cfg.transparent.tproxy_port > 0 {
             m.insert("tproxy-port".into(), cfg.transparent.tproxy_port.into());
         }
     }
@@ -143,6 +178,12 @@ pub fn render(cfg: &Config, proxies: &[Proxy]) -> Rendered {
             ports(&[443, 8443]),
         );
         sn.insert("sniff".into(), sniff.into());
+        // ★ redir-host 必须开 force-dns-mapping（OpenClash yml_change.sh:509）：
+        //   没有 fake-ip 映射表，域名只能靠嗅探还原。忘了这行，
+        //   redir-host 下所有域名类型规则会静默失效。
+        if cfg.sniffer.force_dns_mapping {
+            sn.insert("force-dns-mapping".into(), true.into());
+        }
         if cfg.sniffer.override_destination {
             sn.insert("override-destination".into(), true.into());
         }
@@ -219,6 +260,8 @@ fn ports(p: &[u16]) -> Value {
 }
 
 fn render_dns(cfg: &Config) -> Value {
+    // ★ 与 render() 用同一个拆解结果（唯一事实来源）
+    let rm = crate::runmode::RunMode::resolve(cfg.run_mode);
     let d = &cfg.dns;
     let mut m = Mapping::new();
     m.insert("enable".into(), d.enable.into());
@@ -227,14 +270,18 @@ fn render_dns(cfg: &Config) -> Value {
         m.insert("ipv6".into(), d.ipv6.into());
         m.insert(
             "enhanced-mode".into(),
-            match d.mode {
-                DnsMode::FakeIp => "fake-ip",
-                DnsMode::RedirHost => "redir-host",
+            // ★ enhanced-mode 由 run_mode 统一决定
+                match rm.fake_ip {
+                true => "fake-ip",
+                false => "redir-host",
             }
             .into(),
         );
         if d.mode == DnsMode::FakeIp {
-            m.insert("fake-ip-range".into(), d.fake_ip_range.as_str().into());
+            // fake-ip-range 只在 fake-ip 模式有意义（redir-host 写了也无效）
+            if rm.fake_ip {
+                m.insert("fake-ip-range".into(), d.fake_ip_range.as_str().into());
+            }
             m.insert(
                 "fake-ip-filter-mode".into(),
                 d.fake_ip_filter_mode.as_str().into(),
