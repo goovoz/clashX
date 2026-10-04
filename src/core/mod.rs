@@ -494,8 +494,11 @@ ProtectHome=true
 # 要写 etc/config.yaml 与 var/ 下的缓存
 ReadWritePaths={root}
 PrivateTmp=true
-# 端口 <1024 不需要；≥1024 天然无需特权
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# ★ 必须包含 AF_NETLINK —— `ip` 命令靠 netlink 读网卡信息，
+#   少了它 `ip -4 -br addr` 静默返回空（实测网卡明明是
+#   eth0/172.20.0.101，探测却报「lan_addr 未设置」）。
+#   顺带说明：症状不是报错而是「查不到」，非常容易误判成配置问题。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 LimitNOFILE=65535
 
 [Install]

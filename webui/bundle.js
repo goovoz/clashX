@@ -372,7 +372,13 @@
   // ============ 旁路由 ============
   function Gateway() {
     var s = useState(null);
-    var clients = useState('192.168.10.0/24');
+    var ifaces = useState([]);
+    // 网口绑定 + 地址都允许用户改，探测只作为默认值。
+    // 多网卡机器（双 WAN、管理口分离）上猜错网卡 = 规则打错网段 =
+    // 流量不回环但也不工作 —— 探测只是省事，不能当唯一来源。
+    var iface = useState('');
+    var lanAddr = useState('');
+    var clients = useState('');
     var d = s[0];
     var busy = useState('');
     var msg = useMsg();
@@ -382,14 +388,60 @@
     }, []);
     useEffect(refresh, []);
 
+    // 拉网卡列表并预填
+    useEffect(function () {
+      api('/api/clashx/gateway/ifaces').then(function (r) {
+        var list = r.ifaces || [];
+        ifaces[1](list);
+        // 预填：优先选默认路由所在网卡
+        if (list.length) {
+          var pick = list[0];
+          api('/api/clashx/overview').then(function () {}).catch(function () {});
+          iface[1](pick.name);
+          lanAddr[1](pick.addr);
+          // 客户端网段默认取该网卡所在 /24
+          if (pick.cidr && pick.cidr.includes('/')) {
+            var bits = pick.cidr.split('/')[1];
+            if (bits === '24') {
+              var p3 = pick.addr.split('.').slice(0, 3).join('.');
+              clients[1](p3 + '.0/24');
+            }
+          }
+        }
+      }).catch(function (e) { msg('err', String(e.message || e)); });
+    }, []);
+
+    // 换网口时同步更新地址与客户端网段
+    function onIfaceChange(name) {
+      iface[1](name);
+      var f = ifaces[0].filter(function (x) { return x.name === name; })[0];
+      if (f) {
+        lanAddr[1](f.addr);
+        if (f.cidr && f.cidr.endsWith('/24')) {
+          clients[1](f.addr.split('.').slice(0, 3).join('.') + '.0/24');
+        }
+      }
+    }
+
     function call(path, okMsg) {
       busy[1]('1');
-      api(path, { method: 'POST', body: { clients: clients[0] } })
+      var body = { clients: clients[0] };
+      // 用户显式填了才传 —— 留空则由后端探测
+      if (iface[0]) body.iface = iface[0];
+      if (lanAddr[0]) body.lan_addr = lanAddr[0];
+      api(path, { method: 'POST', body: body })
         .then(function (r) {
-          msg('ok', r.lan_addr ? (okMsg + '（网关 ' + r.lan_addr + '，网卡 ' + r.iface + '）') : okMsg);
+          msg('ok', r.msg || okMsg);
           refresh();
         })
-        .catch(function (e) { msg('err', String(e.message || e)); })
+        .catch(function (e) {
+          // 后端预检失败时带回探测信息，直接展示给用户
+          var msgText = String(e.message || e);
+          api('/api/clashx/gateway/ifaces').then(function (r) {
+            ifaces[1](r.ifaces || []);
+          }).catch(function () {});
+          msg('err', msgText);
+        })
         .then(function () { busy[1](''); });
     }
 
@@ -402,19 +454,48 @@
         </div>
         <div class="card-body">
           <p class="hint tight">
-            启用后把客户端设备的网关指向本机 IP 即可。仅对<strong>传统模式</strong>有效
-            （TUN 模式由 mihomo 自己接管，不需要 nft 规则）。
+            启用后把客户端设备的网关指向下面的「网关地址」即可。
+            仅对<strong>传统模式</strong>有效（TUN 模式由 mihomo 自己接管）。
           </p>
+          <label class="field">
+            <span>网口绑定</span>
+            <select value=${iface[0]} onChange=${function (e) { onIfaceChange(e.target.value); }}>
+              <option value="">自动探测（默认路由网卡）</option>
+              ${ifaces[0].map(function (f) {
+                return html`<option key=${f.name} value=${f.name}>
+                  ${f.name} — ${f.addr}${f.state && f.state !== 'UP' ? '（' + f.state + '）' : ''}
+                </option>`;
+              })}
+            </select>
+          </label>
+          <label class="field">
+            <span>网关地址（本机的局域网地址，客户端要指向它）</span>
+            <input class="mono" type="text" value=${lanAddr[0]}
+              onInput=${function (e) { lanAddr[1](e.target.value); }}
+              placeholder="留空则自动探测" />
+          </label>
           <label class="field">
             <span>客户端网段（逗号分隔，必填）</span>
             <input class="mono" type="text" value=${clients[0]}
-              onInput=${function (e) { clients[1](e.target.value); }} />
+              onInput=${function (e) { clients[1](e.target.value); }}
+              placeholder="192.168.10.0/24" />
+            <div class="hint">
+              只有这些网段的设备会被代理。填错会导致「网关指向了但流量不走代理」。
+            </div>
           </label>
           <div class="btnrow">
             <button class="btn primary" disabled=${!!busy[0]}
               onClick=${function () { call('/api/clashx/gateway/enable', '旁路由已启用'); }}>启用</button>
             <button class="btn danger" disabled=${!!busy[0]}
               onClick=${function () { call('/api/clashx/gateway/disable', '旁路由已停用'); }}>停用</button>
+            <button class="btn sm" disabled=${!!busy[0]}
+              onClick=${function () {
+                busy[1]('1');
+                api('/api/mihomo/connections', { method: 'DELETE' })
+                  .then(function () { msg('ok', '已关闭全部连接'); })
+                  .catch(function (e) { msg('err', String(e.message || e)); })
+                  .then(function () { busy[1](''); });
+              }}>关闭全部连接</button>
           </div>
         </div>
       </div>

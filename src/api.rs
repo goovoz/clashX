@@ -398,6 +398,7 @@ fn api(req: &Request, ctx: &ServerCtx, path: &str) -> Response {
 
         // ---- 旁路由 ----
         "/api/clashx/gateway" => gateway_status(ctx),
+        "/api/clashx/gateway/ifaces" => Response::json(200, list_ifaces().to_string()),
         "/api/clashx/gateway/enable" => {
             if req.method != "POST" {
                 return json_err(405, "用 POST");
@@ -774,10 +775,39 @@ fn gateway_enable(req: &Request, ctx: &ServerCtx) -> Response {
         ..Default::default()
     };
     if let Err(e) = g.precheck() {
-        return json_err(400, format!("{e:#}"));
+        // 报错时把探测结果一起返回 —— 用户能在界面上直接看到
+        // 「网卡有哪几个、地址是多少」，不用去猜或翻文档。
+        let ifaces = list_ifaces();
+        return Response::json(
+            400,
+            json!({
+                "error": format!("{e:#}"),
+                "detected_iface": iface,
+                "detected_lan_addr": lan,
+                "available_ifaces": ifaces,
+                "hint": "可在界面选择网口并填写地址；或用 --iface / --lan-addr 显式指定",
+            })
+            .to_string(),
+        );
     }
     match nft::enable(&g) {
-        Ok(()) => Response::json(200, json!({"ok": true, "lan_addr": lan, "iface": iface}).to_string()),
+        Ok(()) => {
+            Response::json(
+                200,
+                json!({
+                    "ok": true,
+                    "lan_addr": lan,
+                    "iface": iface,
+                    "clients": g.lan_clients,
+                    "msg": format!(
+                        "已启用。客户端网关设为 {}，客户端网段 {}",
+                        lan,
+                        g.lan_clients.join(", ")
+                    ),
+                })
+                .to_string(),
+            )
+        }
         Err(e) => json_err(500, format!("{e:#}")),
     }
 }
@@ -806,18 +836,95 @@ fn detect_lan_addr(iface: &str) -> Option<String> {
         .args(["-4", "-br", "addr", "show", "dev", iface])
         .output()
         .ok()?;
+    // 逐行解析，任何一行读不出来就跳过，**不用 ? 提前返回**。
+    // 原来的写法是 `p.next()?`，`ip -4 -br addr` 输出里只要有一行
+    // 格式不符（空行、多网卡、状态列缺失），整个函数就返回 None ——
+    // 而调用方把它当「探测失败」，于是报「lan_addr 未设置」让用户手填。
+    // 实测 eth0 / 172.20.0.101 完全正常的情况也报错。
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut p = line.split_whitespace();
-        p.next()?;
-        p.next()?; // state
-        if let Some(cidr) = p.next() {
-            let ip = cidr.split('/').next()?;
-            if !ip.starts_with("127.") && !ip.starts_with("169.254.") {
+        let mut it = line.split_whitespace();
+        let name = match it.next() {
+            Some(n) => n,
+            None => continue,
+        };
+        if name != iface {
+            continue;
+        }
+        let _state = it.next(); // UP / UNKNOWN，可能有多个
+        for tok in it {
+            // 后面可能是 CIDR，也可能还有别的 IPv4（secondary address）
+            if !tok.contains('/') && !tok.contains('.') {
+                continue;
+            }
+            let ip = tok.split('/').next().unwrap_or("");
+            if ip.contains('.')
+                && !ip.starts_with("127.")
+                && !ip.starts_with("169.254.")
+                && ip.parse::<std::net::Ipv4Addr>().is_ok()
+            {
                 return Some(ip.to_string());
             }
         }
     }
     None
+}
+
+/// 列出可用的网卡与地址，给界面做「网口绑定」下拉用。
+///
+/// 为什么要让用户选：多网卡机器（双WAN、旁路由 + 管理口分离）上
+/// 猜错网卡 = 规则打错网段 = 流量不回环但也不工作。
+/// 探测只是默认值，用户能改才是可靠的。
+pub fn list_ifaces() -> serde_json::Value {
+    let out = std::process::Command::new("ip")
+        .args(["-4", "-br", "addr"])
+        .output();
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    if let Ok(o) = out {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let mut it = line.split_whitespace();
+            let name = match it.next() {
+                Some(n) => n,
+                None => continue,
+            };
+            // 跳过 lo 与虚拟网卡（TUN 设备等）——
+            // 用户选了 TUN 设备当出口网卡会写出无意义的规则。
+            if name == "lo" || name.starts_with("utun") || name.starts_with("tun")
+                || name.starts_with("Mihomo") || name.starts_with("clash") {
+                continue;
+            }
+            // 虚拟设备（dummy/veth/br-/tun 等）也要排除
+            let state = it.next().unwrap_or("");
+            if name.contains("dummy") || name.starts_with("veth") || name.starts_with("br-") {
+                continue;
+            }
+            let mut addrs = Vec::new();
+            for tok in it {
+                if let Some(ip) = tok.split('/').next() {
+                    if ip.contains('.') && ip.parse::<std::net::Ipv4Addr>().is_ok() {
+                        addrs.push(ip.to_string());
+                    }
+                }
+            }
+            if addrs.is_empty() {
+                continue;
+            }
+            let primary = addrs[0].clone();
+            let cidr = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .find(|l| l.starts_with(name))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .unwrap_or("")
+                .to_string();
+            list.push(serde_json::json!({
+                "name": name,
+                "state": state,
+                "addr": primary,
+                "cidr": cidr,
+                "addrs": addrs,
+            }));
+        }
+    }
+    serde_json::json!({ "ifaces": list })
 }
 
 fn rules_add(req: &Request, ctx: &ServerCtx) -> Response {
