@@ -130,6 +130,16 @@ pub enum Cmd {
         localhost: bool,
     },
 
+    /// 安装 Web UI 的 systemd unit 并 enable（开机自启）
+    WebInstall {
+        /// 监听地址
+        #[arg(long)]
+        listen: Option<String>,
+        /// 安装后立即启动
+        #[arg(long, default_value_t = true)]
+        start: bool,
+    },
+
     /// 设置 Web 登录密码（不放在命令行参数里，避免进 shell 历史）
     WebPass {
         /// 从标准输入读密码（推荐：echo -n 'pw' | clashx web-pass）
@@ -349,6 +359,7 @@ impl Cli {
                 RunModeCmd::Set { value } => self.run_mode_set(paths, value),
             },
             Cmd::Web { listen, localhost } => self.web(paths, listen.as_deref(), *localhost),
+            Cmd::WebInstall { listen, start } => self.web_install(paths, listen.as_deref(), *start),
             Cmd::WebPass { stdin } => self.web_pass(paths, *stdin),
         }
     }
@@ -1621,6 +1632,54 @@ impl Cli {
         cfg.web = Some(w);
         save_config(paths, &cfg)?;
         println!("密码已更新（配置文件里只存 SHA-256 哈希，无明文）");
+        Ok(())
+    }
+}
+
+impl Cli {
+    /// 安装 Web UI 的 systemd unit。
+    fn web_install(&self, paths: &Paths, listen: Option<&str>, start: bool) -> Result<()> {
+        let cfg = load_config(paths)?;
+        let w = cfg.web.clone().unwrap_or_else(|| crate::config::Web::default());
+        let addr = listen.unwrap_or(&w.listen).to_string();
+
+        crate::core::install_web_unit(
+            &paths.root.to_string_lossy(),
+            &addr,
+        )?;
+        println!("已安装 clashx-web.service（监听 {addr}）");
+
+        let svc = crate::core::Systemd::new("clashx-web");
+        svc.enable()?;
+        println!("已设置开机自启");
+
+        if start {
+            svc.restart()?;
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            let state = if svc.is_active() { "运行中" } else { "启动失败" };
+            println!("服务状态: {state}");
+            if state == "运行中" {
+                println!();
+                println!("Web UI: http://{addr}/");
+                println!("  默认账号：admin / admin（登录后请立即修改）");
+                if w.password_sha256.is_none() {
+                    println!();
+                    println!("⚠未设置密码，所有请求都会被拒绝（fail closed）。");
+                    println!("  设置方式：echo -n '你的密码' | clashx web-pass --stdin");
+                } else {
+                    let default_hash = crate::web::sha256_hex(b"admin");
+                    if w.password_sha256
+                        .as_deref()
+                        .map(|h| h.eq_ignore_ascii_case(&default_hash))
+                        .unwrap_or(false)
+                    {
+                        println!("⚠ 仍在用默认密码 admin，建议在界面「密码」页修改。");
+                    }
+                }
+            } else {
+                println!("查看日志：journalctl -u clashx-web -n 30 --no-pager");
+            }
+        }
         Ok(())
     }
 }

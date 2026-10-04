@@ -439,6 +439,72 @@ WantedBy=multi-user.target
     )
 }
 
+/// 生成 Web UI 的 systemd unit。
+///
+/// # 为什么单独一个 unit 而不是并进 mihomo 那个
+///
+/// 「装了 clashx 但不想开Web 管理界面」是合理需求（最小化攻击面、
+/// 只想用代理功能）。合成一个 unit 就没法单独禁用 Web。
+///
+/// 另外 Web UI 挂掉**不应该**影响代理 —— 它只是管理界面，
+/// 把它与内核绑在一起会让一个纯 UI 的崩溃拖垮代理。
+///
+/// # 安全加固
+/// - `User=` 默认 nobody：Web 要改配置文件（规则/订阅/密码），
+///   那些文件属于 root，所以实际必须 root 才能写 —— 这一点与
+///   mihomo 那个 unit 相反（mihomo 只读配置，用 nobody 就够）。
+///   但我们仍然给它 NoNewPrivileges + 完整 Protect*，
+///   因为 Web 绑 0.0.0.0 意味着局域网可达，攻击面比内核大。
+/// - `PrivateTmp=true`：Web 不需要 /tmp 里的东西。
+/// - 不给 Capability：Web 只需要读写自己的配置文件，不需要网络特权。
+pub fn render_web_unit(root: &str, listen: &str) -> String {
+    format!(
+        r#"[Unit]
+Description=clashx Web UI (management interface)
+Documentation=https://github.com/goovoz/clashX
+# 明确不 After=mihomo-client：Web 要能独立重启，
+# 而且内核未启动时 Web 仍应可达（页面会显示「内核未运行」而不是连不上）。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart={root}/bin/mihomo-client --home {root} web --listen {listen}
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# Web 绑 0.0.0.0 供局域网访问，攻击面比内核大 —— 上紧箍。
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+# 要写 etc/config.yaml 与 var/ 下的缓存
+ReadWritePaths={root}
+PrivateTmp=true
+# 端口 <1024 不需要；≥1024 天然无需特权
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        root = root,
+        listen = listen,
+    )
+}
+
+/// 安装 Web UI 的 systemd unit。
+pub fn install_web_unit(root: &str, listen: &str) -> Result<()> {
+    let text = render_web_unit(root, listen);
+    let path = std::path::PathBuf::from("/etc/systemd/system/clashx-web.service");
+    std::fs::write(&path, text)
+        .with_context(|| format!("写入 {}", path.display()))?;
+    Systemd::new("clashx-web").daemon_reload()?;
+    Ok(())
+}
+
 /// 安装 systemd unit（写到 /etc/systemd/system/）。
 pub fn install_unit(
     paths: &Paths,

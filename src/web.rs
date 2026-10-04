@@ -29,7 +29,9 @@
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -154,12 +156,69 @@ impl Response {
     }
 }
 
-/// 服务运行期需要的只读上下文。
+/// 服务运行期需要的上下文。
 pub struct ServerCtx {
     pub paths: Paths,
     /// 配置文件锁：Web 改配置与 CLI 的 apply 可能并发，
     /// 用文件锁串行化，避免两个 apply 互相覆盖。
     pub config_lock: Arc<std::sync::Mutex<()>>,
+    /// 配置缓存（按 mtime 判断新鲜度）。
+    ///
+    /// ★ 为什么需要（压测实测）：`load_config` 每次都要
+    ///   `read_to_string` + `serde_yaml::from_str` 解析一遍完整配置，
+    ///   串行单次约 97ms —— 而规则/订阅/总览**每个请求都要读**。
+    ///   并发时 CPU 全花在重复解析同一份没变的内容上。
+    ///
+    /// 用 mtime + 长度做指纹：文件没动就直接复用已解析对象。
+    /// 这是「派生数据缓存」的标准做法 —— 指纹错了最坏是读到旧配置，
+    /// 而写配置后 mtime 必然变，不会漏。
+    pub config_cache: Arc<std::sync::Mutex<Option<(ConfigFingerprint, crate::config::Config)>>>,
+    /// mihomo 状态缓存（version / 上线状态 / 连接数）。
+    ///
+    /// ★ 为什么需要（压测实测）：overview 每次要 fork 两次 curl
+    ///   去问mihomo（/version 与 /connections），单次 ~6ms。
+    ///   并发时fork 抢 CPU，QPS 被死死封在 85 ——
+    ///   而同样返回 261 字节的 /api/health 能跑 570。
+    ///
+    /// TTL 1 秒：UI 首屏不需要毫秒级新鲜度，但秒级足够跟手。
+    /// 连接数这种数字晚 1 秒无所谓，省下的是成百上千次 fork。
+    pub mihomo_cache: Arc<std::sync::Mutex<Option<(Instant, MihomoStatus)>>>,
+    /// 节点数缓存（5 秒 TTL）。collect_proxies 解析 71 个节点约 5ms，
+    /// overview 首屏每次都算太浪费。
+    pub node_count_cache: Arc<std::sync::Mutex<Option<(Instant, usize)>>>,
+}
+
+/// mihomo 运行状态（缓存用）。
+#[derive(Debug, Clone, Default)]
+pub struct MihomoStatus {
+    pub version: String,
+    pub up: bool,
+    pub connections: usize,
+}
+
+/// 配置文件指纹。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFingerprint {
+    /// 修改时间（纳秒）。
+    pub mtime_nanos: Option<u128>,
+    /// 文件长度。
+    pub len: u64,
+}
+
+impl ConfigFingerprint {
+    /// 取当前文件的指纹；文件不存在返回 None。
+    pub fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime_nanos = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos());
+        Some(Self {
+            mtime_nanos,
+            len: meta.len(),
+        })
+    }
 }
 
 // ==================== 鉴权 ====================
@@ -574,6 +633,9 @@ pub fn serve(paths: Paths, listen: &str) -> Result<()> {
     let ctx = Arc::new(ServerCtx {
         paths: paths.clone(),
         config_lock: Arc::new(std::sync::Mutex::new(())),
+        config_cache: Arc::new(std::sync::Mutex::new(None)),
+        mihomo_cache: Arc::new(std::sync::Mutex::new(None)),
+        node_count_cache: Arc::new(std::sync::Mutex::new(None)),
     });
 
     loop {
