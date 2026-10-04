@@ -44,6 +44,11 @@ impl Paths {
     pub fn systemd_unit(&self) -> PathBuf {
         PathBuf::from("/etc/systemd/system/mihomo-client.service")
     }
+
+    /// 读文本文件，失败返回 None（Web 层用它区分 404 与 500）。
+    pub fn read_to_string_safe(&self) -> Option<String> {
+        std::fs::read_to_string(&self.user_config).ok()
+    }
 }
 
 /// `mihomo -t` 校验配置。
@@ -177,6 +182,52 @@ impl Api {
         } else {
             bail!("切换模式失败：HTTP {code}（内核返回非 2xx）")
         }
+    }
+
+    /// 原始 GET —— Web 转发用，要拿到 HTTP 状态码而不只是 body。
+    ///
+    /// 为什么不复用 `curl()`：那个方法把状态码吞了（只关心 curl 的
+    /// exit code），而 mihomo 的 PUT/DELETE 失败也返回 4xx 且curl
+    /// exit code 为 0 —— 不看状态码就会把失败当成功。
+    pub fn raw_get(&self, path: &str) -> Result<(u16, String)> {
+        self.raw("GET", path, None)
+    }
+    pub fn raw_put(&self, path: &str, body: &str) -> Result<(u16, String)> {
+        self.raw("PUT", path, Some(body))
+    }
+    pub fn raw_post(&self, path: &str, body: &str) -> Result<(u16, String)> {
+        self.raw("POST", path, Some(body))
+    }
+    pub fn raw_delete(&self, path: &str) -> Result<(u16, String)> {
+        self.raw("DELETE", path, None)
+    }
+
+    fn raw(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+        let mut cmd = Command::new("curl");
+        cmd.arg("-s")
+            .arg("--max-time")
+            .arg("30")
+            .arg("-X")
+            .arg(method)
+            .arg("-o")
+            .arg("-")
+            .arg("-w")
+            .arg("\n%{http_code}");
+        if let Some(s) = self.secret.as_ref() {
+            cmd.arg("-H").arg(format!("Authorization: Bearer {s}"));
+        }
+        if let Some(b) = body {
+            cmd.arg("-H").arg("Content-Type: application/json").arg("-d").arg(b);
+        }
+        cmd.arg(format!("{}{}", self.addr, path));
+        let out = cmd.output().context("调用 curl 失败")?;
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        // 最后一个空行后是状态码
+        let (body, code) = match text.rsplit_once('\n') {
+            Some((b, c)) => (b.to_string(), c.trim().parse::<u16>().unwrap_or(0)),
+            None => (text.clone(), 0),
+        };
+        Ok((code, body))
     }
 
     pub fn configs(&self) -> Result<String> {

@@ -1,5 +1,12 @@
 target/
 *.tar.gz
 
-# 工作记忆与本地工具，不进仓库
+# 开发过程的工作记忆，不进仓库
 .workbuddy/
+
+# webui 里从 unpkg 拉下来的库文件（已合并进 bundle.js）
+webui/preact.js
+webui/preact-hooks.js
+webui/preact-compat.js
+webui/htm.js
+webui/app.js

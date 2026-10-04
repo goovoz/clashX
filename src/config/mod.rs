@@ -11,10 +11,55 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Web 管理界面配置。
+///
+/// # 安全设计
+///
+/// - 密码存 **SHA-256 哈希**（hex），不存明文。
+/// - 鉴权用 HTTP Basic Auth —— 简单、无状态、浏览器原生支持弹登录框。
+///   前提是链路可信（局域网），否则凭据在链路上是明文。
+/// - 未配置密码时**拒绝所有访问**（fail closed）：
+///   不能因为「密码为空」就放行 —— 那等于开了个无密码后门。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct Web {
+    /// 是否启用。
+    pub enable: bool,
+    /// 监听地址。绑 0.0.0.0 才能被局域网访问。
+    pub listen: String,
+    /// 用户名。留空则视为 `admin`。
+    pub username: Option<String>,
+    /// 密码的 SHA-256（hex）。None = 拒绝访问。
+    pub password_sha256: Option<String>,
+    /// 凭据有效期（小时）。Basic Auth 本身无状态，
+    /// 浏览器会缓存凭据；这个值目前只用于 UI 提示。
+    pub session_ttl_h: u32,
+}
+
+impl Default for Web {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            listen: "0.0.0.0:9080".into(),
+            username: Some("admin".into()),
+            // admin 的 SHA-256。首次部署能直接登录，登录后应立即改。
+            // 明文是 "admin" —— 写死是为了开箱即用，不是推荐值。
+            password_sha256: Some(
+                "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918".into(),
+            ),
+            session_ttl_h: 24,
+        }
+    }
+}
+
 /// 顶层配置。对应 `config.yaml`（用户配置）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct Config {
+    /// Web 管理界面。
+    #[serde(default)]
+    pub web: Option<Web>,
+
     /// 运行模式（对齐 OpenClash 的 6 值枚举）。
     /// 内部会拆成 dns_mode × firewall_owner 两个维度，
     /// 见 `runmode::RunMode::resolve()`。
@@ -163,6 +208,17 @@ impl Default for Transparent {
             redir_port: 7892,
             tproxy_port: 7894,
         }
+    }
+}
+
+impl Transparent {
+    /// 旁路由的「直连网段」—— Web 层构造 Gateway 时用。
+    ///
+    /// 刻意返回**空**：直连网段该由用户按实际网络声明（CLI 的
+    /// `--direct-nets`、或将来 Web 上的输入框），不该有隐式默认 ——
+    /// 默认带上私网段会误伤（见 nft.rs 里 direct_nets 字段的注释）。
+    pub fn direct_nets_probe(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

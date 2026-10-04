@@ -119,6 +119,23 @@ pub enum Cmd {
     /// 查看 / 切换运行模式（fake-ip / redir-host × 防火墙接管方式）
     #[command(subcommand)]
     RunMode(RunModeCmd),
+
+    /// 启动 Web 管理界面（阻塞式，前台运行）
+    Web {
+        /// 监听地址。省略则读配置里的 web.listen（默认 0.0.0.0:9080）
+        #[arg(long)]
+        listen: Option<String>,
+        /// 只监听本机（不开局域网访问）
+        #[arg(long)]
+        localhost: bool,
+    },
+
+    /// 设置 Web 登录密码（不放在命令行参数里，避免进 shell 历史）
+    WebPass {
+        /// 从标准输入读密码（推荐：echo -n 'pw' | clashx web-pass）
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 /// 旁路由子命令。
@@ -331,6 +348,8 @@ impl Cli {
                 RunModeCmd::Show => self.run_mode_show(paths),
                 RunModeCmd::Set { value } => self.run_mode_set(paths, value),
             },
+            Cmd::Web { listen, localhost } => self.web(paths, listen.as_deref(), *localhost),
+            Cmd::WebPass { stdin } => self.web_pass(paths, *stdin),
         }
     }
 
@@ -1526,5 +1545,82 @@ impl Cli {
             }
         }
         None
+    }
+}
+
+impl Cli {
+    /// 启动 Web 管理界面。
+    ///
+    /// 阻塞运行 —— 与 mihomo 服务分开：mihomo 由 systemd 管，
+    /// Web UI 手动起或另写 unit。理由是 Web UI 不是必需组件，
+    /// 不该因为它起不来而影响代理功能。
+    fn web(&self, paths: &Paths, listen: Option<&str>, localhost: bool) -> Result<()> {
+        let cfg = load_config(paths)?;
+        let wcfg = cfg
+            .web
+            .clone()
+            .unwrap_or_else(|| crate::config::Web::default());
+
+        if !wcfg.enable {
+            bail!("Web UI 已在配置里禁用（web.enable: false）");
+        }
+
+        // 密码缺失时明确告知，不要让人对着 401 猜
+        match wcfg.password_sha256.as_deref() {
+            None => {
+                eprintln!("警告：未设置 web.password，所有请求都会被拒绝（fail closed）。");
+                eprintln!("      设置方式：echo -n '你的密码' | clashx web-pass --stdin");
+            }
+            Some(h) => {
+                // 默认密码未改的风险提示
+                let default_hash = crate::web::sha256_hex(b"admin");
+                if h.eq_ignore_ascii_case(&default_hash) {
+                    eprintln!("提示：当前仍在用默认密码 admin，建议在界面「密码」页修改。");
+                }
+            }
+        }
+
+        let addr = match (listen, localhost) {
+            (Some(a), _) => a.to_string(),
+            (None, true) => wcfg
+                .listen
+                .split_once(':')
+                .map(|(h, p)| format!("127.0.0.1:{p}"))
+                .unwrap_or_else(|| "127.0.0.1:9080".into()),
+            (None, false) => wcfg.listen.clone(),
+        };
+
+        crate::web::serve(paths.clone(), &addr)
+    }
+
+    /// 设置 Web 登录密码。
+    ///
+    /// ★ 密码走 stdin 而不是命令行参数 —— 命令行会进 shell 历史、
+    /// 会出现在 `ps` 的 argv 里。`echo -n 'pw' | clashx web-pass --stdin`
+    /// 仍然是明文过管道，但不会留痕。
+    fn web_pass(&self, paths: &Paths, from_stdin: bool) -> Result<()> {
+        if !from_stdin {
+            bail!(
+                "为避免密码进 shell 历史与 ps 输出，请用：\n  echo -n '你的密码' | clashx web-pass --stdin"
+            );
+        }
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        let pw = buf.trim();
+        if pw.len() < 4 {
+            bail!("密码太短（至少 4 个字符）");
+        }
+        if pw.chars().count() > 128 {
+            bail!("密码过长（>128 字符）");
+        }
+
+        let mut cfg = load_config(paths)?;
+        let mut w = cfg.web.clone().unwrap_or_else(|| crate::config::Web::default());
+        w.password_sha256 = Some(crate::web::sha256_hex(pw.as_bytes()));
+        cfg.web = Some(w);
+        save_config(paths, &cfg)?;
+        println!("密码已更新（配置文件里只存 SHA-256 哈希，无明文）");
+        Ok(())
     }
 }

@@ -6,6 +6,7 @@
 //!
 //! 首版范围（本机代理模式），旁路由在后续迭代。
 
+mod api;
 mod cli;
 mod config;
 mod core;
@@ -14,6 +15,7 @@ mod render;
 mod rule;
 mod runmode;
 mod sub;
+mod web;
 
 use anyhow::Result;
 use clap::Parser;
