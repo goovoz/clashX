@@ -182,6 +182,183 @@ pub fn invalidate_cfg_cache(ctx: &ServerCtx) {
     *guard = None;
 }
 
+
+// ==================== 总览页操作 ====================
+
+/// 内核启停。
+///
+/// 语义与 OpenClash 的「启动 / 停止」一致：直接操作 systemd，
+/// 不做 apply —— apply 是配置生效流程，与服务生命周期是两件事。
+fn svc_action(ctx: &ServerCtx, action: &str) -> Response {
+    let _g = ctx.config_lock.lock().unwrap();
+    let svc = crate::core::Systemd::new("mihomo-client");
+    let r = match action {
+        "start" => svc.restart(), // TUN 设备需要重建，用 restart 而非 start
+        "stop" => svc.stop(),
+        "restart" => svc.restart(),
+        _ => return json_err(400, format!("未知操作 {action}")),
+    };
+    match r {
+        Ok(()) => {
+            // 重启后清缓存：内核状态与连接数都变了
+            let mut g = ctx.mihomo_cache.lock().unwrap();
+            *g = None;
+            Response::json(200, json!({"ok": true, "action": action}).to_string())
+        }
+        Err(e) => json_err(500, format!("{e:#}")),
+    }
+}
+
+/// 刷新 DNS 缓存。
+///
+/// 实现方式：让 mihomo 重新加载当前配置（POST /configs 带 path）。
+/// 这与 OpenClash 的「提交 DNS 缓存」不同 —— OpenClash 靠 dnsmasq
+/// restart 刷自己的缓存，clashX 没有 dnsmasq，mihomo 侧的 fake-ip
+/// 映射与上游解析都由内核持有，重新加载配置是最直接的对等操作。
+fn dns_flush(ctx: &ServerCtx) -> Response {
+    let Some(api) = mihomo_api(ctx) else {
+        return json_err(503, "内核未运行");
+    };
+    // ★ mihomo 1.19 的正确接口是 POST /cache/fakeip/flush（实测 204）。
+    //   之前用 POST /configs 带 path 拿到 405 —— /configs 只接受 PATCH，
+    //   而 PATCH 是热改部分配置用的，整份重载要走 PUT 且会 400。
+    //   fakeip 缓存是fake-ip 模式下最需要能刷的东西（IP 变了但映射还在）。
+    match api.raw_post("/cache/fakeip/flush", "") {
+        Ok((code, text)) if (200..300).contains(&code) => {
+            Response::json(200, r#"{"ok":true,"msg":"DNS 缓存已刷新"}"#)
+        }
+        Ok((code, text)) => json_err(502, format!("内核返回 {code}: {text}")),
+        Err(e) => json_err(502, format!("{e:#}")),
+    }
+}
+
+/// 立即更新所有订阅。
+fn sub_update(ctx: &ServerCtx) -> Response {
+    let _g = ctx.config_lock.lock().unwrap();
+    let mut cfg = match load_cfg(ctx) {
+        Ok(c) => c,
+        Err(e) => return json_err(500, format!("{e:#}")),
+    };
+    // 把所有订阅的缓存删掉，强制下次 collect_proxies 重新抓
+    let mut n = 0;
+    for sub in &cfg.subscriptions {
+        let safe: String = sub
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let f = ctx.paths.root.join("var/subs").join(format!("{safe}.yaml"));
+        if std::fs::remove_file(&f).is_ok() {
+            n += 1;
+        }
+    }
+    // 立即抓一次并应用
+    let r = apply_and_restart(ctx);
+    let mut g = ctx.node_count_cache.lock().unwrap();
+    *g = None;
+    let _ = &mut cfg;
+    match r {
+        Ok(()) => Response::json(
+            200,
+            json!({
+                "ok": true,
+                "cleared": n,
+                "msg": format!("已清除 {n} 个订阅缓存并重新生成"),
+            })
+            .to_string(),
+        ),
+        Err(e) => json_err(500, format!("{e:#}")),
+    }
+}
+
+/// DNS 诊断：解析几个域名看结果是否合理。
+///
+/// 只读操作，不改任何状态 —— 参照 OpenClash 的「DNS 诊断」用途：
+/// 排查污染 / 解析失败。
+fn diag_dns(ctx: &ServerCtx) -> Response {
+    let Some(api) = mihomo_api(ctx) else {
+        return json_err(503, "内核未运行");
+    };
+    // 用 /dns/query 逐个查（GET /dns/query?name=..&type=A）
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for name in ["www.baidu.com", "www.google.com", "github.com"] {
+        let q = crate::web::percent_encode(name);
+        let r = api
+            .raw_get(&format!("/dns/query?name={q}&type=A"))
+            .ok()
+            .and_then(|(c, t)| if (200..300).contains(&c) { Some(t) } else { None });
+        match r {
+            Some(t) => out.push(json!({"name": name, "ok": true, "result": t})),
+            None => out.push(json!({"name": name, "ok": false})),
+        }
+    }
+    Response::json(200, json!({ "items": out }).to_string())
+}
+
+/// 连接诊断：当前连接数、内存、运行时长。
+fn diag_conn(ctx: &ServerCtx) -> Response {
+    let Some(api) = mihomo_api(ctx) else {
+        return json_err(503, "内核未运行");
+    };
+    let conns = api
+        .connections()
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok());
+    let n = conns
+        .as_ref()
+        .and_then(|v| v.get("connections").and_then(|c| c.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+    let down = conns
+        .as_ref()
+        .and_then(|v| v.get("downloadTotal").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+    let up = conns
+        .as_ref()
+        .and_then(|v| v.get("uploadTotal").and_then(|x| x.as_u64()))
+        .unwrap_or(0);
+
+    // 内核进程的资源占用
+    let (rss, threads) = core_rss().unwrap_or((0, 0));
+
+    Response::json(
+        200,
+        json!({
+            "connections": n,
+            "download_total": down,
+            "upload_total": up,
+            "core_rss_kb": rss,
+            "core_threads": threads,
+        })
+        .to_string(),
+    )
+}
+
+/// 读内核进程 RSS 与线程数。
+fn core_rss() -> Option<(u64, u64)> {
+    // 通过 pgrep 找 mihomo 进程
+    let out = std::process::Command::new("pgrep")
+        .args(["-f", "bin/mihomo"])
+        .output()
+        .ok()?;
+    let pid = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()?
+        .trim()
+        .to_string();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let mut rss = 0u64;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            rss = v.split_whitespace().next()?.parse().unwrap_or(0);
+            break;
+        }
+    }
+    let threads = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|d| d.count() as u64)
+        .unwrap_or(0);
+    Some((rss, threads))
+}
+
 fn json_err(status: u16, msg: impl Into<String>) -> Response {
     Response::json(status, json!({ "error": msg.into() }).to_string())
 }
@@ -341,6 +518,18 @@ fn api(req: &Request, ctx: &ServerCtx, path: &str) -> Response {
                 Err(e) => json_err(404, format!("未生成配置：{e}")),
             }
         }
+
+        // ---- 总览页要的快捷操作（对齐 OpenClash status.htm）----
+        "/api/clashx/service/start" => svc_action(ctx, "start"),
+        "/api/clashx/service/stop" => svc_action(ctx, "stop"),
+        "/api/clashx/service/restart" => svc_action(ctx, "restart"),
+        "/api/clashx/dns/flush" => dns_flush(ctx),
+        "/api/clashx/sub/update" => sub_update(ctx),
+        "/api/clashx/diag/dns" => diag_dns(ctx),
+        "/api/clashx/diag/conn" => diag_conn(ctx),
+
+        // ---- 流量统计（流式，特殊处理）----
+        "/api/mihomo/traffic" => traffic(req, ctx),
 
         // ---- mihomo 转发 ----
         p if p.starts_with("/api/mihomo/") => mihomo_proxy(req, ctx, &p["/api/mihomo/".len()..]),
@@ -860,6 +1049,41 @@ fn mask_token(path: &str) -> String {
 
 // ==================== mihomo 转发 ====================
 
+
+/// 流量统计。
+///
+/// ★ mihomo 的 /traffic 是**流式**接口（chunked，1 秒推一行，永不收尾）。
+///   直接用 raw_get 会等到 --max-time 超时才返回（实测 curl 8 秒 timeout），
+///   所以这里单独用 `--max-time 1` 取第一行就掐断。
+///
+/// 前端每 1.5 秒轮询一次，拿到的第一行就是最新的瞬时速率。
+fn traffic(req: &Request, ctx: &ServerCtx) -> Response {
+    let Some(api) = mihomo_api(ctx) else {
+        return json_err(503, "内核未运行");
+    };
+    let out = std::process::Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg("1")  // ★ 流式接口，1 秒足够拿到第一行
+        .arg(format!("{}/traffic", api.addr_public()))
+        .output();
+    match out {
+        Ok(o) => {
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            // 取第一行（流式返回可能是多行）
+            let first = text.lines().next().unwrap_or("").trim();
+            if first.is_empty() {
+                // 内核刚重启或没有流量，返回零值而不是报错 ——
+                // 前端会显示 0 B/s，不需要弹错
+                Response::json(200, r#"{"up":0,"down":0,"upTotal":0,"downTotal":0}"#)
+            } else {
+                Response::json(200, first.to_string())
+            }
+        }
+        Err(e) => json_err(502, format!("{e}")),
+    }
+}
+
 fn mihomo_proxy(req: &Request, ctx: &ServerCtx, sub: &str) -> Response {
     let Some(api) = mihomo_api(ctx) else {
         return json_err(503, "无法确定 mihomo 控制地址（先生成配置）");
@@ -870,6 +1094,7 @@ fn mihomo_proxy(req: &Request, ctx: &ServerCtx, sub: &str) -> Response {
         "PUT" => api.raw_put(&format!("/{}", sub), &body),
         "POST" => api.raw_post(&format!("/{}", sub), &body),
         "DELETE" => api.raw_delete(&format!("/{}", sub)),
+        "PATCH" => api.raw_patch(&format!("/{}", sub), &body),
         _ => return json_err(405, "不支持的方法"),
     };
     match result {

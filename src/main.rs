@@ -124,7 +124,19 @@ pub fn collect_proxies(cfg: &Config, paths: &Paths) -> (Vec<config::Proxy>, Vec<
                             ));
                             Ok((body.clone(), Default::default()))
                         }
-                        None => Err(e),
+                        // ★ 无缓存可用 -> 跳过该订阅，**不让整体失败**。
+                        //   否则形成冷启动死锁：apply 失败 -> 缓存写不上 ->
+                        //   下次 apply 还是失败 -> 永远起不来。
+                        //   实测症状：缓存空 + 订阅抓不到时，overview 串行
+                        //   851ms（有缓存时 97ms），因为每个请求都在等超时。
+                        None => {
+                            warnings.push(format!(
+                                "订阅 {} 暂不可用（{e:#}）—— 已跳过，本次配置的节点会偏少；\
+                                 网络恢复后执行 apply 会自动补上",
+                                s.name
+                            ));
+                            continue;
+                        }
                     },
                 },
             };

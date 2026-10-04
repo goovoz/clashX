@@ -202,6 +202,17 @@ impl Api {
         self.raw("DELETE", path, None)
     }
 
+    /// 供 Web 层直接构造 curl 命令时用（traffic 是流式接口，
+    /// 走不到 raw* 那套 —— 它会等body 收尾）。
+    pub fn addr_public(&self) -> &str {
+        &self.addr
+    }
+
+    /// PATCH（mihomo 热改部分配置用）。
+    pub fn raw_patch(&self, path: &str, body: &str) -> Result<(u16, String)> {
+        self.raw("PATCH", path, Some(body))
+    }
+
     fn raw(&self, method: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
         let mut cmd = Command::new("curl");
         cmd.arg("-s")

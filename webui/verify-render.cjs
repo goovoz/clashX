@@ -131,6 +131,9 @@ const sandbox = {
     : () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{}') }),
   navigator: { userAgent: 'clashx-verify' },
   location: { href: 'http://verify/', protocol: 'http:', host: 'verify' },
+  // app.js 用了 hashchange 监听，沙箱要提供（浏览器天然有）
+  addEventListener() {},
+  removeEventListener() {},
   // ★ 故意不给 module / exports / require —— 见文件头说明
 };
 

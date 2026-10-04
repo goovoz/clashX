@@ -55,39 +55,31 @@
 /* ===== app.js ===== */
 /* clashx Web UI
  *
- * 零构建：用 htm 的 tagged template 写组件，浏览器直接跑。
- * 源码用 include_str! 编译进 clashx 二进制，单文件部署。
+ * 零构建：htm 的 tagged template + Preact，源码用 include_str! 进二进制。
+ * 布局对齐 OpenClash：侧边栏 + 主内容区。
  *
- * 依赖只有两个，都已内联在 index.html 里（preact 11KB + htm 1.3KB）：
- *   - preact@10.25.4  组件模型 + hooks
- *   - htm@3.1.1       html`` 标签编译成 h() 调用
- * 引入它们是为了「不写 React 却有 React 的写法」。手写 html 解析器不划算 ——
- * 边界情况（自闭合标签、属性引号、文本转义）会耗掉的时间远超收益。
- *
- * 为什么不用 React + Vite：管理界面要部署到 OpenWrt / 小主机，
- * 单文件二进制是硬需求。为此引入 pnpm 工具链不划算。
+ * 依赖都在 bundle 里（preact UMD + hooks + compat + shim + htm），
+ * 加载顺序必须是 preact -> preactHooks -> preactCompat -> shim -> htm -> app。
+ * 三个前端坑都记在 build_bundle.sh 的注释里。
  */
 (function () {
   'use strict';
 
-  // ★ 显式从 window 取，不用裸标识符。
-  //   浏览器里 window.X 会有全局变量，但：
-  //   - 严格模式 / 模块作用域下不保证
-  //   - 测试环境（vm 沙箱）里完全没有
-  //   写成window.React.createElement 在任何环境下都成立。
-  var __R = window.React;
-  if (!__R) { console.error('[clashx] React 未就绪，bundle 顺序或shim 有问题'); return; }
-  var __RD = window.ReactDOM;
+  // ★ 一律显式从 window 取，不用裸标识符 —— 严格模式/模块作用域/
+  //   测试沙箱里裸标识符都可能拿不到。
+  var R = window.React;
+  if (!R) { console.error('[clashx] React 未就绪，bundle 顺序或 shim 有问题'); return; }
+  var RD = window.ReactDOM;
 
-  var html = window.htm.bind(__R.createElement);
-  var useState = __R.useState;
-  var useEffect = __R.useEffect;
-  var useCallback = __R.useCallback;
+  var html = window.htm.bind(R.createElement);
+  var useState = R.useState;
+  var useEffect = R.useEffect;
+  var useCallback = R.useCallback;
 
   // ---- API ----
   function api(path, opts) {
     opts = opts || {};
-    return fetch(path, {
+    return window.fetch(path, {
       method: opts.method || 'GET',
       headers: opts.body ? { 'Content-Type': 'application/json' } : {},
       body: opts.body ? JSON.stringify(opts.body) : undefined,
@@ -102,8 +94,8 @@
   }
 
   // ---- 全局提示 ----
-  var MsgCtx = __R.createContext(function () {});
-  function useMsg() { return __R.useContext(MsgCtx); }
+  var MsgCtx = R.createContext(function () {});
+  function useMsg() { return R.useContext(MsgCtx); }
 
   function MsgHost(props) {
     var s = useState(null);
@@ -116,47 +108,229 @@
     <//>`;
   }
 
-  function Badge(props) {
-    return html`<span class="badge ${props.kind || 'dim'}">${props.children}</span>`;
+  function Badge(p) {
+    return html`<span class="badge ${p.kind || 'dim'}">${p.children}</span>`;
   }
 
-  // ==================== 总览 ====================
+  function fmtBytes(n) {
+    n = n || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  }
+  function fmtRate(bps) { return fmtBytes(bps) + '/s'; }
+
+  // ============ 侧边栏导航（分组对齐 OpenClash）============
+  var NAV = [
+    { group: '概览', items: [{ id: 'overview', name: '总览' }] },
+    { group: '代理', items: [
+      { id: 'mode', name: '运行模式' },
+      { id: 'gateway', name: '旁路由' },
+    ]},
+    { group: '配置管理', items: [
+      { id: 'rules', name: '规则' },
+      { id: 'subs', name: '订阅' },
+      { id: 'config', name: '配置文件' },
+    ]},
+    { group: '系统', items: [
+      { id: 'service', name: '服务与诊断' },
+      { id: 'password', name: '密码' },
+    ]},
+  ];
+
+  // ============ 总览（对齐 OpenClash status.htm 五张卡）============
   function Overview() {
-    var s = useState(null);
-    var d = s[0];
-    useEffect(function () {
-      api('/api/clashx/overview').then(s[1]).catch(function (e) { s[1]({ error: String(e.message || e) }); });
+    var ov = useState(null);
+    var traffic = useState({ up: 0, down: 0, upTotal: 0, downTotal: 0 });
+    var busy = useState('');
+    var diag = useState(null);
+    var msg = useMsg();
+    var d = ov[0];
+
+    var load = useCallback(function () {
+      api('/api/clashx/overview').then(ov[1]).catch(function (e) {
+        msg('err', String(e.message || e));
+      });
     }, []);
-    if (!d) return html`<div class="card"><div class="spin">加载中…</div></div>`;
-    if (d.error) return html`<div class="card"><div class="msg err">${d.error}</div></div>`;
+    useEffect(load, []);
+
+    // 流量轮询（mihomo 的 /traffic 每 1.5 秒取一次足够）
+    useEffect(function () {
+      var stop = false;
+      var tick = null;
+      function poll() {
+        if (stop) return;
+        api('/api/mihomo/traffic').then(function (r) {
+          if (stop) return;
+          // 后端把流式响应当多行 JSON 转回来了，取第一行完整的
+          if (r && r.up !== undefined) {
+            traffic[1]({ up: r.up, down: r.down,
+                         upTotal: r.upTotal, downTotal: r.downTotal });
+          }
+          tick = setTimeout(poll, 1500);
+        }).catch(function () {
+          if (!stop) tick = setTimeout(poll, 3000);
+        });
+      }
+      poll();
+      return function () { stop = true; if (tick) clearTimeout(tick); };
+    }, []);
+
+    function act(name, fn, okMsg) {
+      busy[1](name);
+      fn().then(function () { msg('ok', okMsg); load(); })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
+    }
+
+    var b = busy[0];
 
     return html`
-      <div class="card">
-        <h2>状态总览</h2>
-        <div class="grid">
-          <div class="stat"><div class="k">运行模式</div><div class="v" style=${{ fontSize: '15px' }}>${d.run_mode}</div></div>
-          <div class="stat"><div class="k">DNS 模式</div><div class="v" style=${{ fontSize: '15px' }}>${d.dns_mode}</div></div>
-          <div class="stat"><div class="k">节点数</div><div class="v">${d.node_count}</div></div>
-          <div class="stat"><div class="k">规则数</div><div class="v">${d.rule_count}</div></div>
+      <div class="card status-card ${d && !d.mihomo_up ? 'down' : ''}">
+        <div class="status-strip"></div>
+        <div class="status-main">
+          <div class="status-title">
+            <strong>内核</strong>
+            ${d && d.mihomo_up
+              ? html`<${Badge} kind="ok">运行中<//>`
+              : html`<${Badge} kind="err">已停止<//>`}
+            ${d && d.mihomo_version
+              ? html`<span class="mono" style="color:var(--text-dim)">${(d.mihomo_version.match(/"version":"([^"]+)"/) || [, ''])[1]}</span>`
+              : ''}
+          </div>
+          <div class="status-sub">
+            ${d ? d.node_count + ' 个节点 · ' + d.rule_count + ' 条规则 · ' + d.sub_count + ' 个订阅' : '加载中…'}
+          </div>
+        </div>
+        <div class="status-actions">
+          <button class="btn danger" disabled=${!!b}
+            onClick=${function () {
+              if (!confirm('停止内核？期间所有代理流量会中断。')) return;
+              act('stop', function () { return api('/api/clashx/service/stop', { method: 'POST' }); }, '内核已停止');
+            }}>停止</button>
+          <button class="btn" disabled=${!!b}
+            onClick=${function () {
+              act('start', function () { return api('/api/clashx/service/start', { method: 'POST' }); }, '内核已启动');
+            }}>启动</button>
+          <button class="btn" disabled=${!!b}
+            onClick=${function () {
+              act('restart', function () { return api('/api/clashx/service/restart', { method: 'POST' }); }, '内核已重启');
+            }}>重启</button>
         </div>
       </div>
+
       <div class="card">
-        <h2>服务状态</h2>
-        <ul class="list">
-          <li>
-            <span class="grow">内核进程</span>
-            <${Badge} kind=${d.mihomo_up ? 'ok' : 'err'}>${d.mihomo_up ? d.mihomo_version : '未运行'}<//>
-            <a class="btn sm" href="/zashboard/" target="_blank">打开 zashboard</a>
-          </li>
-          <li><span class="grow">活动连接</span><span class="mono">${d.mihomo_connections}</span></li>
-          <li><span class="grow">TUN 设备</span><${Badge} kind=${d.tun ? 'ok' : 'dim'}>${d.tun ? '已启用' : '未启用'}<//></li>
-          <li><span class="grow">旁路由 nft 规则</span><${Badge} kind=${d.gateway ? 'ok' : 'dim'}>${d.gateway ? '已启用' : '未启用'}<//></li>
-          <li><span class="grow">防火墙由谁写</span><span class="mono">${d.firewall}</span></li>
-        </ul>
+        <div class="card-head">
+          <h2>运行模式</h2>
+          <span class="spacer"></span>
+          ${d ? html`<${Badge} kind="accent">${d.run_mode}<//>` : ''}
+        </div>
+        <div class="card-body tight">
+          <div class="grid">
+            <div class="stat"><div class="k">DNS</div><div class="v" style="font-size:15px">${d ? d.dns_mode : '—'}</div></div>
+            <div class="stat"><div class="k">TUN</div><div class="v" style="font-size:15px">${d ? (d.tun ? '启用' : '关闭') : '—'}</div></div>
+            <div class="stat"><div class="k">防火墙</div><div class="v" style="font-size:15px">${d ? d.firewall : '—'}</div></div>
+            <div class="stat"><div class="k">旁路由</div><div class="v" style="font-size:15px">${d ? (d.gateway ? '已启用' : '未启用') : '—'}</div></div>
+          </div>
+          <div class="btnrow" style="margin-top:12px">
+            <a class="btn sm" href="#/mode">切换模式</a>
+            <a class="btn sm" href="#/gateway">旁路由设置</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>面板</h2>
+          <span class="spacer"></span>
+          <span class="hint tight">节点选择与连接查看在这里完成</span>
+        </div>
+        <div class="card-body tight">
+          <div class="btnrow">
+            <a class="btn primary" href="/zashboard/" target="_blank" rel="noopener">zashboard</a>
+            <span class="hint tight">独立面板，独立鉴权</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>快捷操作</h2>
+          <span class="spacer"></span>
+          ${diag[0] ? html`<${Badge} kind="dim">${diag[0]}<//>` : ''}
+        </div>
+        <div class="card-body tight">
+          <div class="btnrow">
+            <button class="btn sm" disabled=${!!b}
+              onClick=${function () {
+                act('dns', function () { return api('/api/clashx/dns/flush', { method: 'POST' }); }, 'DNS 缓存已刷新');
+              }}>刷新 DNS</button>
+            <button class="btn sm" disabled=${!!b}
+              onClick=${function () {
+                if (!confirm('关闭全部连接？正在传输的连接会中断。')) return;
+                act('conn', function () { return api('/api/mihomo/connections', { method: 'DELETE' }); }, '已关闭全部连接');
+              }}>关闭全部连接</button>
+            <button class="btn sm" disabled=${!!b}
+              onClick=${function () {
+                if (!confirm('立即抓取所有订阅并重新生成配置？')) return;
+                act('sub', function () { return api('/api/clashx/sub/update', { method: 'POST' }); }, '订阅已更新');
+              }}>更新订阅</button>
+            <button class="btn sm" disabled=${!!b}
+              onClick=${function () {
+                busy[1]('d');
+                api('/api/clashx/diag/dns').then(function (r) {
+                  var items = r.items || [];
+                  diag[1](items.filter(function (i) { return i.ok; }).length + '/' +
+                           items.length + ' 解析正常');
+                }).catch(function (e) { msg('err', String(e.message || e)); })
+                  .then(function () { busy[1](''); });
+              }}>DNS 诊断</button>
+            <button class="btn sm" disabled=${!!b}
+              onClick=${function () {
+                busy[1]('c');
+                api('/api/clashx/diag/conn').then(function (r) {
+                  diag[1](r.connections + ' 连接 · 内核 ' +
+                           Math.round(r.core_rss_kb / 1024) + ' MB');
+                }).catch(function (e) { msg('err', String(e.message || e)); })
+                  .then(function () { busy[1](''); });
+              }}>连接诊断</button>
+            <button class="btn sm" onClick=${function () { load(); }}>刷新</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>流量统计</h2>
+          <span class="spacer"></span>
+          <span class="hint tight">每 1.5 秒刷新</span>
+        </div>
+        <div class="card-body">
+          <div class="traffic-bars">
+            <div class="tbar">
+              <span class="lbl">下载</span>
+              <span class="track"><span class="fill down"
+                style=${'width:' + Math.min(100, (traffic[0].down / 1048576) * 100) + '%'}></span></span>
+              <span class="val">${fmtRate(traffic[0].down)}</span>
+            </div>
+            <div class="tbar">
+              <span class="lbl">上传</span>
+              <span class="track"><span class="fill up"
+                style=${'width:' + Math.min(100, (traffic[0].up / 1048576) * 100) + '%'}></span></span>
+              <span class="val">${fmtRate(traffic[0].up)}</span>
+            </div>
+          </div>
+          <div class="grid" style="margin-top:14px">
+            <div class="stat"><div class="k">累计下载</div><div class="v" style="font-size:16px">${fmtBytes(traffic[0].downTotal)}</div></div>
+            <div class="stat"><div class="k">累计上传</div><div class="v" style="font-size:16px">${fmtBytes(traffic[0].upTotal)}</div></div>
+            <div class="stat"><div class="k">活动连接</div><div class="v" style="font-size:16px">${d ? d.mihomo_connections : '—'}</div></div>
+          </div>
+        </div>
       </div>`;
   }
 
-  // ==================== 运行模式 ====================
+  // ============ 运行模式 ============
   function RunMode() {
     var s = useState(null);
     var d = s[0];
@@ -175,24 +349,82 @@
 
     return html`
       <div class="card">
-        <h2>运行模式</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          模式 = DNS 解析方式（fake-ip / redir-host）× 防火墙接管方。
-          切换时会自动校准 nftables 规则并重启内核，约 1 秒。
-        </p>
-        <div class="modes">
-          ${(d ? d.all : []).map(function (m) {
-            return html`<button class="mode" aria-pressed=${d.current === m.value} onClick=${function () { apply(m.value); }}>
-              <div class="n">${m.value}</div>
-              <div class="d">DNS ${m.dns} · ${m.tun ? 'TUN' : '传统'} · ${m.firewall}</div>
-            </button>`;
-          })}
+        <div class="card-head"><h2>运行模式</h2></div>
+        <div class="card-body">
+          <p class="hint tight">
+            模式 = DNS 解析方式（fake-ip / redir-host）× 防火墙接管方。
+            切换时会自动校准 nftables 规则并重启内核，约 1 秒。
+          </p>
+          <div class="modes">
+            ${(d ? d.all : []).map(function (m) {
+              return html`<button class="mode" aria-pressed=${d.current === m.value}
+                onClick=${function () { apply(m.value); }}>
+                <div class="n">${m.value}</div>
+                <div class="d">DNS ${m.dns} · ${m.tun ? 'TUN' : '传统'} · ${m.firewall}</div>
+              </button>`;
+            })}
+          </div>
+          ${!d ? html`<div class="spin">加载中…</div>` : ''}
         </div>
-        ${!d ? html`<div class="spin">加载中…</div>` : ''}
       </div>`;
   }
 
-  // ==================== 规则 ====================
+  // ============ 旁路由 ============
+  function Gateway() {
+    var s = useState(null);
+    var clients = useState('192.168.10.0/24');
+    var d = s[0];
+    var busy = useState('');
+    var msg = useMsg();
+
+    var refresh = useCallback(function () {
+      api('/api/clashx/gateway').then(s[1]).catch(function (e) { msg('err', String(e.message || e)); });
+    }, []);
+    useEffect(refresh, []);
+
+    function call(path, okMsg) {
+      busy[1]('1');
+      api(path, { method: 'POST', body: { clients: clients[0] } })
+        .then(function (r) {
+          msg('ok', r.lan_addr ? (okMsg + '（网关 ' + r.lan_addr + '，网卡 ' + r.iface + '）') : okMsg);
+          refresh();
+        })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
+    }
+
+    return html`
+      <div class="card">
+        <div class="card-head">
+          <h2>旁路由（网关模式）</h2>
+          <span class="spacer"></span>
+          ${d ? html`<${Badge} kind=${d.active ? 'ok' : 'dim'}>${d.active ? '已启用' : '未启用'}<//>` : ''}
+        </div>
+        <div class="card-body">
+          <p class="hint tight">
+            启用后把客户端设备的网关指向本机 IP 即可。仅对<strong>传统模式</strong>有效
+            （TUN 模式由 mihomo 自己接管，不需要 nft 规则）。
+          </p>
+          <label class="field">
+            <span>客户端网段（逗号分隔，必填）</span>
+            <input class="mono" type="text" value=${clients[0]}
+              onInput=${function (e) { clients[1](e.target.value); }} />
+          </label>
+          <div class="btnrow">
+            <button class="btn primary" disabled=${!!busy[0]}
+              onClick=${function () { call('/api/clashx/gateway/enable', '旁路由已启用'); }}>启用</button>
+            <button class="btn danger" disabled=${!!busy[0]}
+              onClick=${function () { call('/api/clashx/gateway/disable', '旁路由已停用'); }}>停用</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>防火墙状态</h2></div>
+        <div class="card-body"><pre class="out">${d ? (d.detail || []).join('\n') : '加载中…'}</pre></div>
+      </div>`;
+  }
+
+  // ============ 规则 ============
   function Rules() {
     var s = useState(null);
     var add = useState('');
@@ -202,9 +434,9 @@
     var msg = useMsg();
 
     var refresh = useCallback(function () {
-      api('/api/clashx/rules').then(s[1])
-        .catch(function (e) { msg('err', String(e.message || e)); });
+      api('/api/clashx/rules').then(s[1]).catch(function (e) { msg('err', String(e.message || e)); });
     }, []);
+    useEffect(refresh, []);
 
     function doAdd() {
       var r = add[0].trim();
@@ -227,66 +459,77 @@
 
     return html`
       <div class="card">
-        <h2>规则链<span class="spacer"></span><span class="mono hint">${d ? d.rules.length : 0} 条</span></h2>
-        <ul class="list">
-          ${(d ? d.rules : []).map(function (r, i) {
-            return html`<li key=${i}>
-              <span class="mono grow" title=${r}>${i + 1}. ${r}</span>
-              <button class="btn sm danger" onClick=${function () { doRm(r); }}>删</button>
-            </li>`;
-          })}
-        </ul>
-        ${d && !d.rules.length ? html`<div class="empty">还没有规则</div>` : ''}
+        <div class="card-head">
+          <h2>规则链</h2>
+          <span class="spacer"></span>
+          <span class="mono hint tight">${d ? d.rules.length : 0} 条</span>
+        </div>
+        <div class="card-body">
+          <ul class="list">
+            ${(d ? d.rules : []).map(function (r, i) {
+              return html`<li key=${i}>
+                <span class="mono grow" title=${r}>${i + 1}. ${r}</span>
+                <button class="btn sm danger" onClick=${function () { doRm(r); }}>删</button>
+              </li>`;
+            })}
+          </ul>
+          ${d && !d.rules.length ? html`<div class="empty">还没有规则</div>` : ''}
+        </div>
       </div>
       <div class="card">
-        <h2>添加规则</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          内核原生语法，单行标量。例如 <code>DOMAIN-SUFFIX,example.com,PROXY</code>。
-          添加时会插到 MATCH 之前并立即生效。
-        </p>
-        <label class="field">
-          <span>规则</span>
-          <input class="mono" type="text" value=${add[0]} onInput=${function (e) { add[1](e.target.value); }}
-                 placeholder="GEOIP,CN,DIRECT" />
-        </label>
-        <div class="btnrow"><button class="btn primary" onClick=${doAdd}>添加</button></div>
+        <div class="card-head"><h2>添加规则</h2></div>
+        <div class="card-body">
+          <p class="hint tight">
+            内核原生语法，单行标量。例如 <code>DOMAIN-SUFFIX,example.com,PROXY</code>。
+            添加时会插到 MATCH 之前并立即生效。
+          </p>
+          <label class="field">
+            <span>规则</span>
+            <input class="mono" type="text" value=${add[0]}
+              onInput=${function (e) { add[1](e.target.value); }}
+              placeholder="GEOIP,CN,DIRECT" />
+          </label>
+          <div class="btnrow"><button class="btn primary" onClick=${doAdd}>添加</button></div>
+        </div>
       </div>
       <div class="card">
-        <h2>规则测试器（离线）</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          不发包，按规则链顺序判断某个目标会命中哪条。调试分流问题用这个。
-        </p>
-        <label class="field">
-          <span>目标（域名或 IP，可带端口）</span>
-          <input class="mono" type="text" value=${test[0]} onInput=${function (e) { test[1](e.target.value); }} />
-        </label>
-        <div class="btnrow"><button class="btn" onClick=${doTest}>测试</button></div>
-        ${verdict[0] ? html`
-          <div class="msg ok" style=${{ marginTop: '12px' }}>
-            命中第 <strong>${verdict[0].index}</strong> 条：<code>${verdict[0].rule}</code><br/>
-            类型 <code>${verdict[0].kind}</code> → 策略 <code>${verdict[0].target}</code>
-            ${verdict[0].fallback ? html`<br/><strong>（MATCH 兜底，说明前面都没命中）</strong>` : ''}
-          </div>` : ''}
+        <div class="card-head"><h2>规则测试器（离线）</h2></div>
+        <div class="card-body">
+          <p class="hint tight">不发包，按规则链顺序判断某个目标会命中哪条。调试分流问题用这个。</p>
+          <label class="field">
+            <span>目标（域名或 IP，可带端口）</span>
+            <input class="mono" type="text" value=${test[0]}
+              onInput=${function (e) { test[1](e.target.value); }} />
+          </label>
+          <div class="btnrow"><button class="btn" onClick=${doTest}>测试</button></div>
+          ${verdict[0] ? html`
+            <div class="msg ok" style="margin-top:12px">
+              命中第 <strong>${verdict[0].index}</strong> 条：<code>${verdict[0].rule}</code><br/>
+              类型 <code>${verdict[0].kind}</code> → 策略 <code>${verdict[0].target}</code>
+              ${verdict[0].fallback ? html`<br/><strong>（MATCH 兜底，说明前面都没命中）</strong>` : ''}
+            </div>` : ''}
+        </div>
       </div>`;
   }
 
-  // ==================== 订阅 ====================
+  // ============ 订阅 ============
   function Subs() {
     var s = useState(null);
     var name = useState('');
     var url = useState('');
     var d = s[0];
+    var busy = useState('');
     var msg = useMsg();
 
     var refresh = useCallback(function () {
-      api('/api/clashx/subs').then(s[1])
-        .catch(function (e) { msg('err', String(e.message || e)); });
+      api('/api/clashx/subs').then(s[1]).catch(function (e) { msg('err', String(e.message || e)); });
     }, []);
+    useEffect(refresh, []);
 
     function doAdd() {
       if (!name[0].trim() || !url[0].trim()) return msg('err', '名称与 URL 必填');
       api('/api/clashx/subs/add', { method: 'POST', body: { name: name[0], url: url[0] } })
-        .then(function () { msg('ok', '已保存，在命令行执行 apply 生效'); name[1](''); url[1](''); refresh(); })
+        .then(function () { msg('ok', '已保存'); name[1](''); url[1](''); refresh(); })
         .catch(function (e) { msg('err', String(e.message || e)); });
     }
     function doRm(n) {
@@ -295,119 +538,175 @@
         .then(function () { msg('ok', '已删除'); refresh(); })
         .catch(function (e) { msg('err', String(e.message || e)); });
     }
-
-    return html`
-      <div class="card">
-        <h2>订阅</h2>
-        <ul class="list">
-          ${(d ? d.subs : []).map(function (sb) {
-            return html`<li key=${sb.name}>
-              <div class="grow">
-                <div>${sb.name}</div>
-                <div class="mono hint" title=${sb.url}>${sb.url}</div>
-              </div>
-              <${Badge} kind="dim">${sb.user_agent || 'clash.meta'}<//>
-              <span class="hint">${sb.update_interval}h</span>
-              <button class="btn sm danger" onClick=${function () { doRm(sb.name); }}>删</button>
-            </li>`;
-          })}
-        </ul>
-        ${d && !d.subs.length ? html`<div class="empty">还没有订阅</div>` : ''}
-      </div>
-      <div class="card">
-        <h2>添加订阅</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          URL 会在界面上打码显示，但完整地址存在服务器配置文件里（已受Basic Auth 保护）。
-          抓取失败时自动回退本地缓存，不会阻塞配置生成。
-        </p>
-        <label class="field"><span>名称</span>
-          <input type="text" value=${name[0]} onInput=${function (e) { name[1](e.target.value); }} placeholder="my-provider" /></label>
-        <label class="field"><span>订阅地址</span>
-          <input class="mono" type="text" value=${url[0]} onInput=${function (e) { url[1](e.target.value); }} placeholder="https://…" /></label>
-        <div class="btnrow"><button class="btn primary" onClick=${doAdd}>添加</button></div>
-      </div>`;
-  }
-
-  // ==================== 旁路由 ====================
-  function Gateway() {
-    var s = useState(null);
-    var clients = useState('192.168.10.0/24');
-    var d = s[0];
-    var msg = useMsg();
-
-    var refresh = useCallback(function () {
-      api('/api/clashx/gateway').then(s[1])
-        .catch(function (e) { msg('err', String(e.message || e)); });
-    }, []);
-
-    function enable() {
-      msg('info', '正在启用旁路由…');
-      api('/api/clashx/gateway/enable', { method: 'POST', body: { clients: clients[0] } })
-        .then(function (r) { msg('ok', '已启用（网关 ' + r.lan_addr + '，网卡 ' + r.iface + '）'); refresh(); })
-        .catch(function (e) { msg('err', String(e.message || e)); });
-    }
-    function disable() {
-      msg('info', '正在停用…');
-      api('/api/clashx/gateway/disable', { method: 'POST' })
-        .then(function () { msg('ok', '已停用'); refresh(); })
-        .catch(function (e) { msg('err', String(e.message || e)); });
+    function doUpdate() {
+      if (!confirm('立即抓取所有订阅并重新生成配置？')) return;
+      busy[1]('u');
+      api('/api/clashx/sub/update', { method: 'POST' })
+        .then(function (r) { msg('ok', r.msg || '已更新'); refresh(); })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
     }
 
     return html`
       <div class="card">
-        <h2>旁路由（网关模式）
+        <div class="card-head">
+          <h2>订阅</h2>
           <span class="spacer"></span>
-          <${Badge} kind=${d && d.active ? 'ok' : 'dim'}>${d && d.active ? '已启用' : '未启用'}<//>
-        </h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          启用后把客户端设备的网关指向本机 IP 即可。仅对<strong>传统模式</strong>有效
-          （TUN 模式由 mihomo 自己接管，不需要 nft 规则）。
-        </p>
-        <label class="field">
-          <span>客户端网段（逗号分隔，必填）</span>
-          <input class="mono" type="text" value=${clients[0]} onInput=${function (e) { clients[1](e.target.value); }} />
-        </label>
-        <div class="btnrow">
-          <button class="btn primary" onClick=${enable}>启用</button>
-          <button class="btn danger" onClick=${disable}>停用</button>
+          <button class="btn sm" disabled=${!!busy[0]} onClick=${doUpdate}>全部更新</button>
+        </div>
+        <div class="card-body">
+          <ul class="list">
+            ${(d ? d.subs : []).map(function (sb) {
+              return html`<li key=${sb.name}>
+                <div class="grow">
+                  <div>${sb.name}</div>
+                  <div class="sub mono" title=${sb.url}>${sb.url}</div>
+                </div>
+                <${Badge} kind="dim">${sb.user_agent || 'clash.meta'}<//>
+                <span class="sub">${sb.update_interval}h</span>
+                <button class="btn sm danger" onClick=${function () { doRm(sb.name); }}>删</button>
+              </li>`;
+            })}
+          </ul>
+          ${d && !d.subs.length ? html`<div class="empty">还没有订阅</div>` : ''}
         </div>
       </div>
       <div class="card">
-        <h2>防火墙状态</h2>
-        <pre class="out">${d ? (d.detail || []).join('\n') : '加载中…'}</pre>
+        <div class="card-head"><h2>添加订阅</h2></div>
+        <div class="card-body">
+          <p class="hint tight">
+            URL 会在界面上打码显示，但完整地址存在服务器配置文件里（已受 Basic Auth 保护）。
+            抓取失败时自动回退本地缓存，不会阻塞配置生成。
+          </p>
+          <label class="field"><span>名称</span>
+            <input type="text" value=${name[0]} onInput=${function (e) { name[1](e.target.value); }}
+              placeholder="my-provider" /></label>
+          <label class="field"><span>订阅地址</span>
+            <input class="mono" type="text" value=${url[0]} onInput=${function (e) { url[1](e.target.value); }}
+              placeholder="https://…" /></label>
+          <div class="btnrow"><button class="btn primary" onClick=${doAdd}>添加</button></div>
+        </div>
       </div>`;
   }
 
-  // ==================== 配置 ====================
-  function ConfigView() {
-    var s = useState(null);
-    useEffect(function () {
-      api('/api/clashx/rendered').then(function (t) { s[1](t.raw || ''); })
-        .catch(function (e) { s[1]('（读取失败：' + e.message + '）'); });
-    }, []);
-    return html`<pre class="out">${s[0] || '加载中…'}</pre>`;
+  // ============ 服务与诊断 ============
+  function ServicePage() {
+    var diag = useState(null);
+    var busy = useState('');
+    var msg = useMsg();
+
+    function call(path, okMsg) {
+      busy[1]('1');
+      api(path, { method: 'POST' })
+        .then(function () { msg('ok', okMsg); })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
+    }
+    function doDnsDiag() {
+      busy[1]('d');
+      api('/api/clashx/diag/dns').then(function (r) { diag[1]({ kind: 'dns', data: r.items || [] }); })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
+    }
+    function doConnDiag() {
+      busy[1]('c');
+      api('/api/clashx/diag/conn').then(function (r) { diag[1]({ kind: 'conn', data: r }); })
+        .catch(function (e) { msg('err', String(e.message || e)); })
+        .then(function () { busy[1](''); });
+    }
+
+    var d = diag[0];
+
+    return html`
+      <div class="card">
+        <div class="card-head"><h2>服务控制</h2></div>
+        <div class="card-body">
+          <div class="btnrow">
+            <button class="btn" disabled=${!!busy[0]}
+              onClick=${function () { call('/api/clashx/service/start', '已启动'); }}>启动内核</button>
+            <button class="btn danger" disabled=${!!busy[0]}
+              onClick=${function () { if (confirm('停止内核？')) call('/api/clashx/service/stop', '已停止'); }}>停止内核</button>
+            <button class="btn" disabled=${!!busy[0]}
+              onClick=${function () { call('/api/clashx/service/restart', '已重启'); }}>重启内核</button>
+            <span style="flex:1"></span>
+            <button class="btn sm" disabled=${!!busy[0]}
+              onClick=${function () { call('/api/clashx/dns/flush', 'DNS 缓存已刷新'); }}>刷新 DNS</button>
+            <button class="btn sm" disabled=${!!busy[0]}
+              onClick=${function () {
+                if (!confirm('关闭全部连接？')) return;
+                api('/api/mihomo/connections', { method: 'DELETE' })
+                  .then(function () { msg('ok', '已关闭全部连接'); })
+                  .catch(function (e) { msg('err', String(e.message || e)); });
+              }}>关闭全部连接</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <h2>诊断</h2>
+          <span class="spacer"></span>
+          <button class="btn sm" disabled=${!!busy[0]} onClick=${doConnDiag}>连接诊断</button>
+          <button class="btn sm" disabled=${!!busy[0]} onClick=${doDnsDiag}>DNS 诊断</button>
+        </div>
+        <div class="card-body">
+          ${!d ? html`<div class="empty">点上方按钮运行诊断</div>` : ''}
+          ${d && d.kind === 'conn' ? html`
+            <div class="grid">
+              <div class="stat"><div class="k">活动连接</div><div class="v">${d.data.connections}</div></div>
+              <div class="stat"><div class="k">累计下载</div><div class="v" style="font-size:16px">${fmtBytes(d.data.download_total)}</div></div>
+              <div class="stat"><div class="k">累计上传</div><div class="v" style="font-size:16px">${fmtBytes(d.data.upload_total)}</div></div>
+              <div class="stat"><div class="k">内核内存</div><div class="v" style="font-size:16px">${Math.round(d.data.core_rss_kb / 1024)} <small>MB</small></div></div>
+              <div class="stat"><div class="k">内核线程</div><div class="v" style="font-size:16px">${d.data.core_threads}</div></div>
+            </div>` : ''}
+          ${d && d.kind === 'dns' ? html`
+            ${d.data.map(function (it) {
+              var ans = '';
+              if (it.ok) {
+                try {
+                  var j = JSON.parse(it.result);
+                  var a = (j.Answer || []).filter(function (x) { return x.type === 1; });
+                  ans = a.length ? a.map(function (x) { return x.data; }).join(', ')
+                                  : ((j.Answer || [])[0] || {}).data || '';
+                } catch (e) { ans = it.result; }
+              }
+              return html`<div class="diag-item" key=${it.name}>
+                <span class="name">${it.name}</span>
+                <${Badge} kind=${it.ok ? 'ok' : 'err'}>${it.ok ? '正常' : '失败'}<//>
+                <span class="grow mono">${ans}</span>
+              </div>`;
+            })}` : ''}
+        </div>
+      </div>`;
   }
 
+  // ============ 配置文件 ============
   function ConfigPage() {
-    var s = useState(null);
+    var uc = useState(null);
+    var rc = useState(null);
     useEffect(function () {
-      api('/api/clashx/config').then(function (t) { s[1](t.raw || ''); })
-        .catch(function (e) { s[1]('（读取失败：' + e.message + '）'); });
+      api('/api/clashx/config').then(function (t) { uc[1](t.raw || ''); })
+        .catch(function (e) { uc[1]('（读取失败：' + e.message + '）'); });
+      api('/api/clashx/rendered').then(function (t) { rc[1](t.raw || ''); })
+        .catch(function (e) { rc[1]('（读取失败：' + e.message + '）'); });
     }, []);
     return html`
       <div class="card">
-        <h2>渲染产物（config.gen.yaml）</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>clashx 生成、交给 mihomo 的实际配置，含订阅展开后的节点。</p>
-        <${ConfigView}/>
+        <div class="card-head"><h2>渲染产物（config.gen.yaml）</h2></div>
+        <div class="card-body">
+          <p class="hint tight">clashx 生成、交给 mihomo 的实际配置，含订阅展开后的节点。</p>
+          <pre class="out">${rc[0] || '加载中…'}</pre>
+        </div>
       </div>
       <div class="card">
-        <h2>用户配置（config.yaml）</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>只读。修改请用命令行编辑后执行 apply。</p>
-        <pre class="out">${s[0] || '加载中…'}</pre>
+        <div class="card-head"><h2>用户配置（config.yaml）</h2></div>
+        <div class="card-body">
+          <p class="hint tight">只读。修改请用命令行编辑后执行 apply。</p>
+          <pre class="out">${uc[0] || '加载中…'}</pre>
+        </div>
       </div>`;
   }
 
-  // ==================== 密码 ====================
+  // ============ 密码 ============
   function PasswordPage() {
     var old = useState('');
     var nw = useState('');
@@ -429,55 +728,121 @@
 
     return html`
       <div class="card">
-        <h2>修改登录密码</h2>
-        <p class="hint" style=${{ marginTop: 0 }}>
-          密码以 SHA-256 哈希存储，配置文件里没有明文。默认 admin/admin，
-          首次登录后请立即修改。
-        </p>
-        <label class="field"><span>当前密码</span>
-          <input type="password" value=${old[0]} onInput=${function (e) { old[1](e.target.value); }} /></label>
-        <label class="field"><span>新密码（至少 4 个字符）</span>
-          <input type="password" value=${nw[0]} onInput=${function (e) { nw[1](e.target.value); }} /></label>
-        <label class="field"><span>确认新密码</span>
-          <input type="password" value=${nw2[0]} onInput=${function (e) { nw2[1](e.target.value); }} /></label>
-        <div class="btnrow"><button class="btn primary" onClick=${change}>修改</button></div>
+        <div class="card-head"><h2>修改登录密码</h2></div>
+        <div class="card-body">
+          <p class="hint tight">
+            密码以 SHA-256 哈希存储，配置文件里没有明文。默认 admin/admin，
+            首次登录后请立即修改。
+          </p>
+          <label class="field"><span>当前密码</span>
+            <input type="password" value=${old[0]} onInput=${function (e) { old[1](e.target.value); }} /></label>
+          <label class="field"><span>新密码（至少 4 个字符）</span>
+            <input type="password" value=${nw[0]} onInput=${function (e) { nw[1](e.target.value); }} /></label>
+          <label class="field"><span>确认新密码</span>
+            <input type="password" value=${nw2[0]} onInput=${function (e) { nw2[1](e.target.value); }} /></label>
+          <div class="btnrow"><button class="btn primary" onClick=${change}>修改</button></div>
+        </div>
       </div>`;
   }
 
-  // ==================== 根 ====================
-  var TABS = [
-    { id: 'overview', name: '总览', C: Overview },
-    { id: 'mode', name: '运行模式', C: RunMode },
-    { id: 'rules', name: '规则', C: Rules },
-    { id: 'subs', name: '订阅', C: Subs },
-    { id: 'gateway', name: '旁路由', C: Gateway },
-    { id: 'config', name: '配置', C: ConfigPage },
-    { id: 'password', name: '密码', C: PasswordPage },
-  ];
+  // ============ 根组件 ============
+  var PAGES = {
+    overview: Overview,
+    mode: RunMode,
+    gateway: Gateway,
+    rules: Rules,
+    subs: Subs,
+    service: ServicePage,
+    config: ConfigPage,
+    password: PasswordPage,
+  };
+  var TITLES = {
+    overview: '总览', mode: '运行模式', gateway: '旁路由',
+    rules: '规则', subs: '订阅', service: '服务与诊断',
+    config: '配置文件', password: '密码',
+  };
 
-  function App() {
-    var tab = useState('overview');
-    var cur = TABS.filter(function (t) { return t.id === tab[0]; })[0];
-    var Body = cur.C;
+  function currentPage() {
+    var h = (window.location.hash || '').replace(/^#\/?/, '');
+    return PAGES[h] ? h : 'overview';
+  }
 
+  function Sidebar(props) {
+    var ov = useState(null);
+    // 侧边栏状态点：定期刷新内核是否在跑
+    useEffect(function () {
+      var t = null;
+      function load() {
+        api('/api/clashx/overview').then(function (r) {
+          ov[1]({ up: r.mihomo_up, gw: r.gateway });
+        }).catch(function () {});
+      }
+      load();
+      t = setInterval(load, 5000);
+      return function () { if (t) clearInterval(t); };
+    }, []);
+
+    var s = ov[0] || {};
     return html`
-      <div class="wrap">
-        <header class="top">
-          <h1>clashx</h1>
-          <${Badge} kind="dim">Linux 无桌面 mihomo 客户端<//>
-          <span class="spacer"></span>
-          <a class="btn sm" href="/zashboard/" target="_blank">zashboard ↗</a>
-        </header>
-        <nav class="tabs">
-          ${TABS.map(function (t) {
-            return html`<button key=${t.id} aria-selected=${tab[0] === t.id}
-                    onClick=${function () { tab[1](t.id); }}>${t.name}</button>`;
+      <aside class="sidebar">
+        <div class="side-brand">
+          <div class="name">clashx</div>
+          <div class="ver">Linux 无桌面 mihomo 客户端</div>
+        </div>
+        <nav class="side-nav">
+          ${NAV.map(function (g) {
+            return html`<div key=${g.group}>
+              <div class="side-group">${g.group}</div>
+              ${g.items.map(function (it) {
+                var dot = '';
+                if (it.id === 'overview' && s.up !== undefined) {
+                  dot = html`<span class=${'badge-dot' + (s.up ? '' : ' off')}></span>`;
+                } else if (it.id === 'gateway' && s.gw !== undefined) {
+                  dot = html`<span class=${'badge-dot' + (s.gw ? '' : ' off')}></span>`;
+                }
+                return html`<button key=${it.id} class="side-item"
+                  aria-current=${props.page === it.id ? 'page' : null}
+                  onClick=${function () { window.location.hash = '#/' + it.id; }}>
+                  ${it.name}${dot}
+                </button>`;
+              })}
+            </div>`;
           })}
         </nav>
-        <${MsgHost}><${Body}/><//>
+        <div class="side-foot">
+          <a class="btn sm" href="/zashboard/" target="_blank" rel="noopener">zashboard ↗</a>
+        </div>
+      </aside>`;
+  }
+
+  function App() {
+    var pg = useState(currentPage());
+
+    // hash 变化时切页（浏览器前进后退也生效）
+    useEffect(function () {
+      function onHash() { pg[1](currentPage()); }
+      window.addEventListener('hashchange', onHash);
+      return function () { window.removeEventListener('hashchange', onHash); };
+    }, []);
+
+    var Body = PAGES[pg[0]] || Overview;
+
+    return html`
+      <div class="shell">
+        <${Sidebar} page=${pg[0]}/>
+        <div class="main">
+          <div class="topbar">
+            <h1>${TITLES[pg[0]] || '总览'}</h1>
+            <span class="spacer"></span>
+            <a class="btn sm" href="/zashboard/" target="_blank" rel="noopener">面板 ↗</a>
+          </div>
+          <div class="content">
+            <${MsgHost}><${Body}/><//>
+          </div>
+        </div>
       </div>`;
   }
 
-  __RD.createRoot(document.getElementById('root')).render(html`<${App}/>`);
+  RD.createRoot(document.getElementById('root')).render(html`<${App}/>`);
   window.__clashx = { api: api };
 })();
