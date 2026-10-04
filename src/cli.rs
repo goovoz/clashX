@@ -148,12 +148,13 @@ pub const ALL_RUN_MODES: [crate::runmode::RunMode; 6] = [
 pub enum GwsCmd {
     /// 启用旁路由：nftables + policy routing
     Enable {
-        /// 本机局域网地址（旁路由的网关地址）
+        /// 本机局域网地址（旁路由的网关地址）。
+        /// 省略时自动探测（取默认路由所在网段的本机地址）
         #[arg(long)]
-        lan_addr: String,
-        /// 出口网卡
+        lan_addr: Option<String>,
+        /// 出口网卡。省略时自动探测默认路由出口
         #[arg(long)]
-        iface: String,
+        iface: Option<String>,
         /// 客户端网段，逗号分隔（只这些网段的流量会被代理）
         #[arg(long, default_value = "")]
         clients: String,
@@ -170,10 +171,12 @@ pub enum GwsCmd {
     Status,
     /// 打印将要应用的 nft 规则（调试用，不实际应用）
     DryRun {
+        /// 本机局域网地址（省略则自动探测）
         #[arg(long)]
-        lan_addr: String,
+        lan_addr: Option<String>,
+        /// 出口网卡（省略则自动探测）
         #[arg(long)]
-        iface: String,
+        iface: Option<String>,
         #[arg(long, default_value = "")]
         clients: String,
         #[arg(long, default_value_t = 7894)]
@@ -323,7 +326,7 @@ impl Cli {
             Cmd::Mode { value } => self.set_mode(paths, value),
             Cmd::Show => self.show(paths),
             Cmd::Ifaces => self.ifaces(),
-            Cmd::Gateway(c) => self.gateway(c),
+            Cmd::Gateway(c) => self.gateway(paths, c),
             Cmd::RunMode(c) => match c {
                 RunModeCmd::Show => self.run_mode_show(paths),
                 RunModeCmd::Set { value } => self.run_mode_set(paths, value),
@@ -1292,7 +1295,7 @@ impl Cli {
         g
     }
 
-    fn gateway(&self, c: &GwsCmd) -> Result<()> {
+    fn gateway(&self, paths: &Paths, c: &GwsCmd) -> Result<()> {
         use crate::nft;
         match c {
             GwsCmd::Enable {
@@ -1302,7 +1305,22 @@ impl Cli {
                 tproxy_port,
                 dns_port,
             } => {
-                let g = Self::build_gw(lan_addr, iface, clients, *tproxy_port, *dns_port);
+                // 缺省时自动探测：网卡走默认路由检测，本机地址取
+                // 该网卡上的第一个全局 IPv4。这样 `gateway enable`
+                // 不必每次都填三个参数。
+                let iface = iface
+                    .clone()
+                    .or_else(default_route_iface)
+                    .ok_or_else(|| anyhow::anyhow!("探测不到出口网卡，请用 --iface 指定"))?;
+                let lan_addr = match lan_addr {
+                    Some(a) => a.clone(),
+                    None => Self::detect_lan_addr(&iface).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "探测不到 {iface} 上的本机 IPv4 地址，请用 --lan-addr 指定"
+                        )
+                    })?,
+                };
+                let g = Self::build_gw(&lan_addr, &iface, clients, *tproxy_port, *dns_port);
                 g.precheck()?;
                 nft::enable(&g)?;
                 println!("旁路由已启用");
@@ -1330,7 +1348,12 @@ impl Cli {
                 tproxy_port,
                 dns_port,
             } => {
-                let g = Self::build_gw(lan_addr, iface, clients, *tproxy_port, *dns_port);
+                let iface = iface.clone().or_else(default_route_iface).unwrap_or_default();
+                let lan_addr = match lan_addr {
+                    Some(a) => a.clone(),
+                    None => Self::detect_lan_addr(&iface).unwrap_or_default(),
+                };
+                let g = Self::build_gw(&lan_addr, &iface, clients, *tproxy_port, *dns_port);
                 print!("{}", nft::render_ruleset(&g));
                 eprintln!("--- policy routing ---");
                 eprint!("{}", nft::render_policy_route());
@@ -1384,7 +1407,13 @@ impl Cli {
 
         let mut cfg = load_config(paths)?;
         if cfg.run_mode == target {
-            println!("运行模式已经是 {}，无需改动", target.as_str());
+            //★ 即使模式没变，也要校准 nft 状态。
+            //   真机踩过：先前手动 gateway enable 装过规则，切TUN 模式时
+            //   因为「已经是该模式」提前返回，nft 没卸载，
+            //   clashx 与 mihomo 两套表同时 hook prerouting 导致出站不通。
+            //   状态是「派生量」，必须每次都对齐，不能只在变化时更新。
+            Self::sync_nft(&target);
+            println!("运行模式已经是 {}，已校准防火墙状态。", target.as_str());
             return Ok(());
         }
         let old = cfg.run_mode;
@@ -1399,12 +1428,103 @@ impl Cli {
         save_config(paths, &cfg)?;
         println!("运行模式: {} -> {}", old.as_str(), target.as_str());
 
+        // ★ 切模式前先调整 nft 规则 —— 顺序很关键。
+        Self::sync_nft(&target);
+        let _ = &cfg;
+        //
+        // 真机踩过的坑：TUN 模式下 mihomo 的 auto-redirect 会自己建
+        // `table inet mihomo`（hook prerouting，priority dstnat+1），
+        // 而 clashx 的 `table inet clashx`（priority mangle=-150）也在
+        // 抓流量。两套表同时生效 = 流量被 tproxy 与 redirect 双重接管，
+        // 表现为「mihomo 选中了节点、连接也建立了，但出站就是不通」。
+        //
+        // 所以：mihomo 接管防火墙时，clashx 必须先撤掉自己的规则。
+        let fw = target.resolve().firewall;
+        if fw == crate::runmode::FirewallOwner::Mihomo {
+            if crate::nft::is_active() {
+                crate::nft::disable()?;
+                println!("已卸载 clashx 的 nft 规则（改由 mihomo 接管）");
+            }
+        } else if !crate::nft::is_active() {
+            // 反向：从 TUN 切回传统模式时，把 clashx 的规则装回去
+            println!("提示：当前是 {} 模式，clashx 的 nft 规则未启用。", target.as_str());
+            println!("      旁路由需要的话执行：clashx gateway enable --lan-addr <本机IP> \\");
+            println!("        --iface <网卡> --clients <客户端网段>");
+        }
+
         // 落盘后立即 apply，让 mihomo -t 先校验一遍
         self.apply(paths, false)?;
 
-        println!("配置已校验，重启内核使tun / dns 模式生效...");
+        println!("配置已校验，重启内核使 tun / dns 模式生效...");
         crate::core::Systemd::new("mihomo-client").restart()?;
-        println!("完成。验证：clashx run-mode show");
+
+        // 重启后再确认一次状态，给出明确反馈
+        let svc = if crate::core::Systemd::new("mihomo-client").is_active() {
+            "运行中"
+        } else {
+            "启动失败（跑 clashx service log 看详情）"
+        };
+        println!("完成：内核 {svc}，nft 规则 {}。", if crate::nft::is_active() { "已启用" } else { "未启用" });
+        println!("验证：clashx run-mode show && clashx gateway status");
         Ok(())
+    }
+}
+
+impl Cli {
+    /// 按运行模式校准防火墙规则状态。
+    ///
+    /// nft 规则是运行模式的**派生量**：模式决定谁写防火墙，
+    /// 规则必须与之一致。nft 规则是「装上就一直在」的东西，
+    /// 而模式可能因手动 gateway 命令而与规则脱节，
+    /// 所以每次切模式（含「已经是该模式」的情况）都要对齐。
+    fn sync_nft(target: &crate::runmode::RunMode) {
+        let fw = target.resolve().firewall;
+        // 只有 **Mihomo 独占** 时才卸载 clashx 的规则。
+        // Both（mix 模式）不能卸 —— 它的语义就是「clashx 的 tproxy 兜底
+        // + tun 补TCP/UDP」，两条腿都要留着。上一版按
+        // `fw != Clashx` 判断，把mix 也误卸了，回归时发现。
+        if fw == crate::runmode::FirewallOwner::Mihomo {
+            if crate::nft::is_active() {
+                match crate::nft::disable() {
+                    Ok(()) => println!("已卸载 clashx 的 nft 规则（改由 mihomo 接管）"),
+                    // 卸载失败不算致命：mihomo 的 TUN 不依赖它，
+                    // 最坏情况是流量被双重接管，用户自己能看出来。
+                    Err(e) => println!("警告：卸载 clashx nft 规则失败（{e:#}）"),
+                }
+            }
+        } else if !crate::nft::is_active() {
+            println!("提示：{} 模式下clashx 的 nft 规则未启用。", target.as_str());
+            println!("      旁路由需要时执行：clashx gateway enable --lan-addr <本机IP> \\");
+            println!("        --iface <网卡> --clients <客户端网段>");
+        }
+    }
+}
+
+impl Cli {
+    /// 取指定网卡上的第一个全局 IPv4 地址。
+    ///
+    /// 为什么不用 `ip route get` 那套：它给的是「对外可达的源地址」，
+    /// 在多网卡 / policy routing 环境下可能不是我们想暴露给局域网的那个。
+    /// 直接读网卡地址更直观，也和用户配置 `interface-name` 的意图一致。
+    fn detect_lan_addr(iface: &str) -> Option<String> {
+        let out = std::process::Command::new("ip")
+            .args(["-4", "-br", "addr", "show", "dev", iface])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            // 输出形如：eth0  UP  172.20.0.101/24
+            let mut parts = line.split_whitespace();
+            let _name = parts.next()?;
+            let _state = parts.next()?;
+            if let Some(cidr) = parts.next() {
+                let ip = cidr.split('/').next()?;
+                // 跳过 127.x 与链路本地
+                if !ip.starts_with("127.") && !ip.starts_with("169.254.") {
+                    return Some(ip.to_string());
+                }
+            }
+        }
+        None
     }
 }
