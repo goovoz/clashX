@@ -426,7 +426,7 @@ impl Cli {
             }
         }
         let core = resolve_core(self, paths)?;
-        let (proxies, warns) = crate::collect_proxies(&cfg);
+        let (proxies, warns) = crate::collect_proxies(&cfg, paths);
         for w in &warns {
             eprintln!("提示: {w}");
         }
@@ -450,7 +450,7 @@ impl Cli {
             eprintln!("提示: {w}");
         }
 
-        let (proxies, warns) = crate::collect_proxies(&cfg);
+        let (proxies, warns) = crate::collect_proxies(&cfg, paths);
         for w in &warns {
             eprintln!("提示: {w}");
         }
@@ -777,7 +777,7 @@ impl Cli {
     // ---- nodes ----
     fn nodes(&self, paths: &Paths, brief: bool) -> Result<()> {
         let cfg = load_config(paths)?;
-        let (proxies, warns) = crate::collect_proxies(&cfg);
+        let (proxies, warns) = crate::collect_proxies(&cfg, paths);
         for w in &warns {
             eprintln!("提示: {w}");
         }
@@ -1114,7 +1114,7 @@ impl Cli {
     // ---- show ----
     fn show(&self, paths: &Paths) -> Result<()> {
         let cfg = load_config(paths)?;
-        let (proxies, warns) = crate::collect_proxies(&cfg);
+        let (proxies, warns) = crate::collect_proxies(&cfg, paths);
         for w in &warns {
             eprintln!("提示: {w}");
         }

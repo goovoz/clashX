@@ -209,6 +209,68 @@ pub fn parse_sub_headers(h: &BTreeMap<String, String>) -> SubInfo {
     info
 }
 
+
+/// 订阅缓存。
+///
+/// # 为什么需要（真机压测发现的缺陷）
+///
+/// TUN 模式下访问机场订阅会超时 —— 订阅服务器在境外，走 TUN 绕路
+/// 反而不通（境内直连时是好的）。叠加 `curl --max-time 60`，
+/// 后果是**每次 `apply` 都白等 60 秒**：切一次模式要一分钟，
+/// 6 模式压测跑一轮就是 5 分钟纯粹在等超时。
+///
+/// 对策与 OpenClash 一致：**抓取成功写缓存，失败回退旧缓存**。
+/// 订阅是「配置输入」而非「运行依赖」，暂时拿不到时用旧的继续跑，
+/// 比阻塞在超时上正确得多。
+pub mod cache {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// 缓存根目录：`<install_root>/var/subs/`。
+    fn cache_dir(root: &Path) -> PathBuf {
+        root.join("var/subs")
+    }
+
+    fn body_path(root: &Path, name: &str) -> PathBuf {
+        // 文件名做安全化：订阅名可能含斜杠等字符
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        cache_dir(root).join(format!("{safe}.yaml"))
+    }
+
+    /// 读缓存，返回 (body, 是否过期)。缓存不存在时返回 None。
+    pub fn load(root: &Path, name: &str, max_age_h: u32) -> Option<(String, bool)> {
+        let p = body_path(root, name);
+        let body = std::fs::read_to_string(&p).ok()?;
+        if body.is_empty() {
+            return None;
+        }
+        let stale = match (std::fs::metadata(&p).ok()?.modified().ok(), max_age_h) {
+            (Some(mtime), 0) => true, // 0 = 只在失败时用，不看年龄
+            (Some(mtime), h) => {
+                mtime.elapsed().map(|d| d.as_secs() > (h as u64) * 3600).unwrap_or(true)
+            }
+            (None, _) => true,
+        };
+        Some((body, stale))
+    }
+
+    /// 写缓存。失败不致命 —— 只是没有下次可回退而已。
+    pub fn store(root: &Path, name: &str, body: &str) -> Result<()> {
+        let dir = cache_dir(root);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("创建订阅缓存目录 {}", dir.display()))?;
+        let p = body_path(root, name);
+        // 原子写：先写临时文件再改名，避免半截文件被当成有效缓存
+        let tmp = p.with_extension("yaml.tmp");
+        std::fs::write(&tmp, body).with_context(|| format!("写订阅缓存 {}", tmp.display()))?;
+        std::fs::rename(&tmp, &p).with_context(|| format!("替换订阅缓存 {}", p.display()))?;
+        Ok(())
+    }
+}
+
 /// 抓取订阅。
 ///
 /// 走 curl 而不用 reqwest —— 保持依赖最小（见 Cargo.toml 注释）。
@@ -238,7 +300,12 @@ pub fn fetch(sub: &Subscription, base_url: &str) -> Result<(String, BTreeMap<Str
     let mut cmd = std::process::Command::new("curl");
     cmd.arg("-sS")
         .arg("--max-time")
-        .arg("60")
+        // ★ 15s 而非 60s：机场订阅服务器正常响应在 1-3 秒内，
+        //   60s 是拍脑袋定的上限。真机压测发现 TUN 模式下订阅抓不回来，
+        //   每次 apply 白等 60 秒（6 模式切换 = 5 分钟纯等待）。
+        //   降到 15s 后，配合缓存回退，切模式耗时降到秒级。
+        //   确实需要长连接的场景可以给 Subscription 加 timeout 字段。
+        .arg("15")
         .arg("--compressed")
         .arg("-A")
         .arg(ua)

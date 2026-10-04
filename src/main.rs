@@ -77,7 +77,7 @@ pub fn save_config(paths: &Paths, cfg: &Config) -> Result<()> {
 ///
 /// 订阅抓取失败**不阻断**整体流程 —— 一个订阅挂了不该让整个配置
 /// 生成不出来。失败原因通过返回值里的警告列表带给调用方。
-pub fn collect_proxies(cfg: &Config) -> (Vec<config::Proxy>, Vec<String>) {
+pub fn collect_proxies(cfg: &Config, paths: &Paths) -> (Vec<config::Proxy>, Vec<String>) {
     let mut warnings = Vec::new();
 
     // 手动节点（写死在配置里的）
@@ -87,7 +87,47 @@ pub fn collect_proxies(cfg: &Config) -> (Vec<config::Proxy>, Vec<String>) {
     }
 
     for s in &cfg.subscriptions {
-        match sub::fetch(s, "") {
+        // ★ 缓存优先。真机压测发现的性能缺陷：
+        //   .101跑 TUN 模式时，机场订阅（在境外）走 TUN 绕路反而不通，
+        //   curl --max-time 60 → **每次 apply 都白等 60 秒**。
+        //   6 模式切换压测跑一轮，5 分钟纯粹在等超时。
+        //
+        //   策略（与 OpenClash 一致）：
+        //   1. 缓存新鲜（age < update_interval）→ 直接用，不发请求
+        //   2. 否则抓取；成功则更新缓存
+        //   3. 抓取失败但有旧缓存 → 用旧缓存继续，在 warning 里说明
+        //   4. 抓取失败且无缓存 → 如实报错
+        //
+        //   订阅是「配置输入」不是「运行依赖」，暂时拿不到时用旧的
+        //   继续跑，比阻塞在超时上正确得多。
+        let cached = sub::cache::load(&paths.root, &s.name, s.update_interval);
+
+        let fetched: Result<(String, std::collections::BTreeMap<String, String>)> =
+            match &cached {
+                // 缓存够新：连网络都不碰
+                Some((body, false)) => Ok((body.clone(), Default::default())),
+                _ => match sub::fetch(s, "") {
+                    Ok((body, headers)) => {
+                        if let Err(e) = sub::cache::store(&paths.root, &s.name, &body) {
+                            warnings.push(format!("订阅 {} 缓存写入失败：{e:#}", s.name));
+                        }
+                        Ok((body, headers))
+                    }
+                    // 抓取失败：回退旧缓存
+                    Err(e) => match &cached {
+                        Some((body, _)) => {
+                            warnings.push(format!(
+                                "订阅 {} 抓取失败（{e:#}），改用本地缓存",
+                                s.name
+                            ));
+                            Ok((body.clone(), Default::default()))
+                        }
+                        None => Err(e),
+                    },
+                },
+            };
+
+        match fetched {
             Ok((body, headers)) => {
                 let info = sub::parse_sub_headers(&headers);
                 let fmt = sub::detect_format(&body);
