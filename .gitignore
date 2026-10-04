@@ -4,9 +4,12 @@ target/
 # 开发过程的工作记忆，不进仓库
 .workbuddy/
 
-# webui 里从 unpkg 拉下来的库文件（已合并进 bundle.js）
+# webui 依赖：从 unpkg 拉取后由 build_bundle.sh 合并进 bundle.js
 webui/preact.js
+webui/preact-umd.js
 webui/preact-hooks.js
 webui/preact-compat.js
 webui/htm.js
 webui/app.js
+webui/bundle.js
+webui/bundle.js.tmp
