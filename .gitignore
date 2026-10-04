@@ -13,3 +13,4 @@ webui/htm.js
 webui/app.js
 webui/bundle.js
 webui/bundle.js.tmp
+webui/verify-render.js
